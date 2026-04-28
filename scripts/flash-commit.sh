@@ -51,4 +51,4 @@ until adb get-state 2>/dev/null | grep -q '^device$'; do
   sleep 3
 done
 
-log "=== flash-commit done; on slot b. Run soak monitor next. ==="
+log "=== flash-commit done; research kernel now on boot_a (active). Run soak monitor next. ==="
