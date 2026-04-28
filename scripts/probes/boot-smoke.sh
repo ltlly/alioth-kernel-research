@@ -13,10 +13,12 @@ adb shell id | grep -q "uid=0" || fail "adb not root"
 adb shell getprop sys.boot_completed | grep -q "1" || fail "boot not completed"
 
 # No kernel BUG/oops in dmesg.
-# Use word boundaries to avoid matching "debug" / "ramoops" / "mtdoops".
-if adb shell 'dmesg 2>/dev/null | grep -E "BUG: |Unable to handle kernel|Kernel panic|\\bOops\\b"' | grep -q .; then
+# Use leading-space patterns to avoid matching "debug" / "ramoops" / "mtdoops".
+# (toybox grep doesn't support \b word boundaries)
+issues=$(adb shell 'dmesg 2>/dev/null | grep -E "BUG: |Unable to handle kernel|Kernel panic| Oops "' 2>/dev/null)
+if [[ -n "$issues" ]]; then
   echo "WARNING: dmesg shows potential kernel issues:"
-  adb shell 'dmesg 2>/dev/null | grep -E "BUG: |Unable to handle kernel|Kernel panic|\\bOops\\b"' | head -5
+  echo "$issues" | head -5
   fail "dmesg shows kernel issues"
 fi
 
