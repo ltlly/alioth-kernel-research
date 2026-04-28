@@ -43,22 +43,21 @@ while ! fastboot devices | grep -q .; do
 done
 log "device in fastboot"
 
-# Layer B: switch active slot to _a (cheapest recovery)
-log "setting active slot to a"
-fastboot --set-active=a 2>&1 | tee -a "$LOG"
-
-# Layer C: re-flash stock _a if requested AND active slot is already a
+# Virtual A/B device — slot _b is not standalone. Recovery is just re-flash
+# stock boot_a. Always do this on Layer B (no point in slot-switching).
+if [[ ! -f "$STOCK/boot_a-original.img" ]]; then
+  log "FATAL: stock backup missing at $STOCK; cannot recover"
+  exit 4
+fi
+log "re-flashing stock boot_a (research kernel may have broken — restoring stock)"
+fastboot flash boot_a "$STOCK/boot_a-original.img" 2>&1 | tee -a "$LOG"
 if (( auto_stock )); then
-  if [[ ! -f "$STOCK/boot_a-original.img" ]]; then
-    log "FATAL: stock backup missing at $STOCK; cannot recover"
-    exit 4
-  fi
-  log "re-flashing stock boot to slot a"
-  fastboot flash boot_a "$STOCK/boot_a-original.img" 2>&1 | tee -a "$LOG"
   if [[ -f "$STOCK/dtbo_a-original.img" ]]; then
     fastboot flash dtbo_a "$STOCK/dtbo_a-original.img" 2>&1 | tee -a "$LOG"
   fi
 fi
+log "ensuring active slot is a"
+fastboot --set-active=a 2>&1 | tee -a "$LOG"
 
 log "rebooting"
 fastboot reboot 2>&1 | tee -a "$LOG"

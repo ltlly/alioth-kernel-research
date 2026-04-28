@@ -28,12 +28,14 @@ done
 log "current slots:"
 fastboot getvar all 2>&1 | grep -E "current-slot|has-slot|slot-count" || true
 
-# Defensive: never touch slot _a — only flash boot_b
-log "flashing $img to boot_b"
-fastboot flash boot_b "$img"
+# Virtual A/B device: only slot _a has standalone system/vendor; slot _b is
+# COW-snapshot-only and cannot boot independently. So we flash boot_a (the
+# active slot) directly. Recovery: re-flash stock boot_a from
+# workspace/stock-images/ via fastboot at any time.
+log "flashing $img to boot_a (Virtual A/B device — boot_b cannot boot standalone)"
+fastboot flash boot_a "$img"
 
-log "setting active=b"
-fastboot --set-active=b
+log "active slot remains _a (no switch needed)"
 
 log "rebooting"
 fastboot reboot
