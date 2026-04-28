@@ -2,7 +2,7 @@
 
 | Phase | State | Notes |
 |---|---|---|
-| Pre-Phase | in-progress | bootstrap |
+| Pre-Phase | in-progress | deps installed (pahole v1.31) |
 | Phase 0 (vanilla) | pending | |
 | Phase 1 (BTF+ftrace+KSU) | pending | |
 | Phase 2 (BPF backport) | pending | |
