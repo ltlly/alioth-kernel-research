@@ -4,7 +4,7 @@
 |---|---|---|
 | Pre-Phase | DONE | deps + scripts + stock backup + kernel source pinned |
 | Phase 0 (vanilla) | DONE | NDK r29 clang r563880c match for stock; vermagic identical |
-| Phase 1 (BTF+ftrace+KSU) | **DONE — KSU fully working** | Latest KSU v3.2.4: pmd_leaf fix unlocked phys_from_virt → all syscall hooks + supercalls + manager init now active |
+| Phase 1 (BTF+ftrace+KSU) | **DONE — KSU + Manager + Permissive 全活** | Latest KSU v3.2.4 + Manager APK installed; SELinux auto-Permissive via init.rc; ksud-kernel ioctl 通信验证 |
 | Phase 2 (BPF backport) | pending | |
 
 ## Current device state
@@ -67,7 +67,22 @@ For your security research use (frida + BPF + stackplz from `adb shell`): no SEL
 
 ### Manager APK + ksud daemon
 
-Userspace components: not installed. Once installed, the kernel side services their supercall ioctls correctly via the now-working hook path.
+✅ **Installed and working**:
+- `me.weishu.kernelsu` package installed via `adb install`
+- ksud sub-processes execute on-demand from manager
+- logcat shows ksud successfully querying kernel features:
+  ```
+  ksud::cli: command: Feature { command: Get { id: "sulog" } }
+  ksud::cli: command: Feature { command: Check { id: "adb_root" } }
+  ```
+- Kernel responds via our 4.19-compat'd feature handler subsystem
+
+### Auto-Permissive at boot
+
+Injected `setenforce 0` into KSU's init.rc fragment at multiple stages
+(`on early-init`, `on post-fs-data`, `on nonencrypted`, `on property:sys.boot_completed=1`).
+The post-boot_completed trigger reliably sets Permissive after Android's
+`selinux_setup` runs. Verified `getenforce` returns `Permissive` post-boot.
 
 To fully restore KSU functionality on 4.19 would require ~1-2 weeks of arch-specific work:
 1. Reimplement syscall hook layer for 4.19 syscall table layout
