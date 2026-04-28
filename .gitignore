@@ -10,5 +10,9 @@ workspace/kernel/linux-stable/
 # But keep small control/state files committed:
 !workspace/kernel/SOURCE_COMMIT
 !workspace/kernel/DEFCONFIG.env
-workspace/tests/arm64/
+workspace/tests/
+workspace/releases/
+workspace/stock-images/unpack-boot-*.log
+workspace/stock-images/unpacked-boot-*/
 runs/
+

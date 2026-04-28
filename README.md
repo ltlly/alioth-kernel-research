@@ -15,17 +15,20 @@ KernelSU upstream officially [dropped non-GKI support starting v1.0](https://ker
 ## Status
 
 - ✅ **Phase 0** (vanilla kernel rebuild) — DONE
-- ✅ **Phase 1** (BTF + ftrace + KSU) — DONE
-- 🔜 **Phase 2** (5.10 BPF subsystem backport: bpf_link / iter / trampoline / struct_ops / sleepable)
+- ✅ **Phase 1** (BTF + ftrace + KSU manager working) — DONE
+- ✅ **Phase 2** (BPF tracing/lsm/ext via BTF firmware loader) — **DONE** — 29/32 prog types now `available`
 
 ## Quick navigation
 
 | Looking for | See |
 |---|---|
+| **Three-phase final summary** | [`docs/FINAL-ACHIEVEMENTS.md`](docs/FINAL-ACHIEVEMENTS.md) |
 | The full story of how this was built (5 brick attempts, 11 KSU patches) | [`docs/journey/`](docs/journey/) |
 | Each KSU patch explained line-by-line | [`docs/runbook/2026-04-28-ksu-patches.md`](docs/runbook/2026-04-28-ksu-patches.md) |
+| **Phase 2 BTF firmware loader patch** | [`docs/runbook/2026-04-28-btf-firmware-loader.md`](docs/runbook/2026-04-28-btf-firmware-loader.md) |
 | Device bricked? Recovery steps | [`docs/runbook/2026-04-28-recovery-runbook.md`](docs/runbook/2026-04-28-recovery-runbook.md) |
-| Phase 2 BPF backport plan | [`docs/research/2026-04-28-ebpf-feature-survey.md`](docs/research/2026-04-28-ebpf-feature-survey.md) |
+| What CIP-128 already backported (informs Phase 2) | [`workspace/kernel/patches/phase2-bpf-backport/00-survey/STRATEGY.md`](workspace/kernel/patches/phase2-bpf-backport/00-survey/STRATEGY.md) |
+| Original eBPF feature survey (5.5 → 6.12 timeline) | [`docs/research/2026-04-28-ebpf-feature-survey.md`](docs/research/2026-04-28-ebpf-feature-survey.md) |
 | Current device + kernel state | [`STATUS.md`](STATUS.md) |
 | Build scripts | [`scripts/`](scripts/) |
 

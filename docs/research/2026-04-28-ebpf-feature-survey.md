@@ -5,6 +5,24 @@
 
 This is research input to `2026-04-28-alioth-bpf-kernelsu-design.md`. It is **descriptive**, not prescriptive — it lays out facts and tradeoffs; the design doc decides.
 
+> ## Update 2026-04-28: actual outcome
+>
+> When we surveyed the running 4.19-cip source tree we found that **CIP-128 had
+> already backported all 5 series this doc proposes** (`bpf_link`, `bpf_iter`,
+> BPF trampoline, `struct_ops`, sleepable BPF — all present in `kernel/bpf/`).
+> The only blocker was that `tracing`/`lsm`/`ext` prog types need
+> `btf_vmlinux` populated, which traditionally comes from the in-kernel
+> `.BTF` section that breaks alioth's bootloader (Image > 64MB).
+>
+> We solved that with a 50-line patch to `btf_parse_vmlinux()` that lazily
+> loads BTF from `/data/local/tmp/vmlinux.btf` via `kernel_read_file_from_path()`
+> on first verifier use. Result: 29 of 32 BPF prog types now `available`.
+>
+> Sections 5–7 of this survey (cherry-pick strategy, LOC budget, etc.) were
+> written assuming we'd be doing the cherry-picks ourselves. They are kept as
+> historical context; the actual fix is in
+> `docs/runbook/2026-04-28-btf-firmware-loader.md`.
+
 ---
 
 ## 1. Reference points: Android GKI and upstream Linux BPF lineage

@@ -9,12 +9,18 @@
 - [`superpowers/plans/2026-04-28-alioth-bpf-kernelsu.md`](superpowers/plans/2026-04-28-alioth-bpf-kernelsu.md) — 实施计划（每步 bite-sized 任务）
 - [`research/2026-04-28-ebpf-feature-survey.md`](research/2026-04-28-ebpf-feature-survey.md) — eBPF 特性调研（5.5 → 6.12 时间线）
 
-### 工程日志（Phase 0 + Phase 1 完成）
-- [`journey/2026-04-28-phase0-phase1-journey.md`](journey/2026-04-28-phase0-phase1-journey.md) — **完整工程日志：5 次砖手 + 11 个 KSU 兼容补丁的故事**
+### 工程日志（Phase 0 + Phase 1 + Phase 2 完成）
+- [`journey/2026-04-28-phase0-phase1-phase2-journey.md`](journey/2026-04-28-phase0-phase1-phase2-journey.md) — **完整工程日志：5 次砖 + 11 个 KSU 兼容补丁 + Phase 2 BTF firmware loader 4 次踩坑**
+- [`FINAL-ACHIEVEMENTS.md`](FINAL-ACHIEVEMENTS.md) — **三阶段成果总结（推荐入口）**
 
 ### Runbook
 - [`runbook/2026-04-28-ksu-patches.md`](runbook/2026-04-28-ksu-patches.md) — **每个 KSU 文件改动的详细解释**
+- [`runbook/2026-04-28-btf-firmware-loader.md`](runbook/2026-04-28-btf-firmware-loader.md) — **Phase 2: tracing/lsm/ext 解锁原理 + 50 行 patch 详解**
 - [`runbook/2026-04-28-recovery-runbook.md`](runbook/2026-04-28-recovery-runbook.md) — **设备砖了怎么救**
+
+### Phase 2 patch + 工件
+- `workspace/kernel/patches/phase2-bpf-backport/00-survey/STRATEGY.md` — Phase 2 调研结论：CIP 已 backport 五大系列
+- `workspace/kernel/patches/phase2-bpf-backport/00-survey/btf-fw/vmlinux.btf` — 4.19-strict BTF 文件（部署到 `/data/local/tmp/`）
 
 ### 项目级状态
 - [`/STATUS.md`](../STATUS.md) — 当前 phase 进度、device 状态、下一步
@@ -23,8 +29,10 @@
 
 | 需求 | 看这个 |
 |---|---|
+| 想看整个项目做了什么 | [FINAL-ACHIEVEMENTS](FINAL-ACHIEVEMENTS.md) |
 | 我刷砖了 | [recovery-runbook](runbook/2026-04-28-recovery-runbook.md) |
 | 想在另一台 4.19 设备复现 KSU 兼容补丁 | [ksu-patches](runbook/2026-04-28-ksu-patches.md) |
-| 想理解为什么走到现在的方案（5 次砖的故事） | [phase0-phase1-journey](journey/2026-04-28-phase0-phase1-journey.md) |
-| Phase 2（BPF backport）路线 | [feature-survey](research/2026-04-28-ebpf-feature-survey.md) §5 |
+| 想搞清楚 BTF firmware loader 怎么做的 | [btf-firmware-loader](runbook/2026-04-28-btf-firmware-loader.md) |
+| 想理解为什么走到现在的方案（5 + 4 次踩坑） | [phase0-phase1-phase2-journey](journey/2026-04-28-phase0-phase1-phase2-journey.md) |
+| 想知道 Phase 2 实际做了哪些 vs 计划 | [STRATEGY.md](../workspace/kernel/patches/phase2-bpf-backport/00-survey/STRATEGY.md) |
 | 当前 active boot_a 跑啥版本 | [STATUS.md](../STATUS.md) |

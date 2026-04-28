@@ -5,14 +5,16 @@
 | Pre-Phase | DONE | deps + scripts + stock backup + kernel source pinned |
 | Phase 0 (vanilla) | DONE | NDK r29 clang r563880c match for stock; vermagic identical |
 | Phase 1 (BTF+ftrace+KSU) | **🏆 完整功能 — Manager「工作中 ✓」** | KSU v3.2.4 全集成: 16 个 KSU 文件 patch + 真实 supercall dispatch + apk_sign 验证我们 fork 的 manager; 「Crowning manager」+ 「工作中 ✓」<GKI> 状态; 4 个 tab 全可用 |
-| Phase 2 (BPF backport) | pending | |
+| Phase 2 (BPF backport) | **🏆 tracing+lsm+ext 解锁** | CIP 已 backport bpf_link/iter/trampoline/struct_ops/sleepable; 我们 patch btf.c+verifier.c 增加 BTF firmware 加载（绕开 alioth 的 64MB Image 限制）→ 29/32 prog types available。仅 `syscall` / `netfilter` 真正缺（5.14+/6.x） |
 
 ## Current device state
 
 - Active slot: `_a` (research kernel: P1 = ftrace + kprobes + KSU + detached BTF)
+- Latest research kernel: `workspace/builds/20260428-214502-p2-btf-fw6.img` (P2 = P1 + BTF firmware loader patch)
 - `/proc/version` shows `(claude@research)` — our build
 - KSU module: loaded, feature handlers registered
-- BTF file at `/data/local/tmp/vmlinux.btf` (9.7MB, extracted from BTF-enabled build)
+- BTF file at `/data/local/tmp/vmlinux.btf` (9.7MB strict-4.19, no FLOAT/ENUM64/etc) — required at runtime for tracing/lsm/ext
+- Canonical strict BTF: `workspace/kernel/patches/phase2-bpf-backport/00-survey/btf-fw/vmlinux.btf`
 - Stock backup at `workspace/stock-images/boot_a-original.img` for instant restore
 - AVB: vbmeta_a + vbmeta_b flashed with `--disable-verification`
 
@@ -26,6 +28,25 @@
 ✅ KSU sulog and adb_root handlers registered
 ✅ frida unaffected (no kernel dependency)
 ✅ adb root persists (userdebug ROM)
+
+## What works in Phase 2 (BTF firmware loader)
+
+✅ **`tracing` prog type** (fentry/fexit/raw_tp_writable) — newly available
+✅ **`lsm` prog type** (BPF_PROG_TYPE_LSM) — newly available
+✅ **`ext` prog type** (program extensions) — newly available
+✅ **`struct_ops`** (already worked in P1 source, now also verified at runtime)
+✅ **All 18 BPF map types** including ringbuf/sockhash/devmap/cpumap/xskmap
+✅ in-kernel `btf_vmlinux` populated from `/data/local/tmp/vmlinux.btf` via `kernel_read_file_from_path()`
+✅ NetBpfLoad / gpuMem / netd / ringbuf — 60+ existing BPF programs continue running unaffected
+
+⚠️ `syscall` (5.14+) and `netfilter` (6.x) prog types — not backported, would need source-level work
+
+### The BTF firmware loader patch
+
+`kernel/bpf/btf.c::btf_parse_vmlinux()` + `kernel/bpf/verifier.c::bpf_get_btf_vmlinux()`:
+当 `__start_BTF == __stop_BTF`（无 .BTF section）时，从 FS 加载 BTF 文件。
+绕开 alioth bootloader 的 ~64MB Image 大小限制——内核 Image 零增长。
+完整说明: `docs/runbook/2026-04-28-btf-firmware-loader.md`
 
 ## KSU on 4.19 — full capability (final state)
 

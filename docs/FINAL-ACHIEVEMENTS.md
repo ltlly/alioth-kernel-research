@@ -1,13 +1,20 @@
-# Phase 0 + Phase 1 — Final Achievements
+# Phase 0 + Phase 1 + Phase 2 — Final Achievements
 
 **Date:** 2026-04-28
 **Device:** Xiaomi alioth (Redmi K40 / POCO F3 / Mi 11X)
 **Kernel:** Linux 4.19.325-cip128 (LineageOS 23.2 nightly)
 **KSU version:** v3.2.4 — the LATEST KernelSU release as of this work
 
-## Headline result
+## Headline results
 
-**Latest KernelSU v3.2.4 fully working on Linux 4.19 + alioth + LineageOS 23.2**, including:
+1. **Latest KernelSU v3.2.4 fully working on Linux 4.19 + alioth + LineageOS 23.2** — Manager「工作中 ✓」
+2. **BPF tracing / lsm / ext prog types unlocked on 4.19** via a 50-line `btf_parse_vmlinux()` firmware-loader patch — no kernel size growth, no bootloader brick
+
+29 of 32 BPF prog types are now `available` according to `bpftool feature probe`.
+The 3 still missing (`syscall`, `netfilter`, `lirc_mode2`) require source-level
+backport from 5.14+/6.x or are device-irrelevant.
+
+## Phase 1 — Latest KernelSU v3.2.4 fully working
 
 ✅ Manager APK shows **「工作中 ✓」** (Working) with `<GKI>` tag
 ✅ Kernel module loaded; all syscall hooks active (setresuid/execve/newfstatat/faccessat)
@@ -98,13 +105,85 @@ KSU dmesg evidence:
   KernelSU: handle_setresuid from 0 to N (live syscall hook firing)
 ```
 
-## Phase 2 — what's next
+## Phase 2 — BPF tracing / lsm / ext unlocked
 
-With KSU + BPF infrastructure (ftrace/kprobes/uprobes + detached BTF) all live, Phase 2 is the BPF backport:
-- bpf_link (5.7)
-- bpf_iter (5.6)
-- BPF trampoline + fentry/fexit (5.5)
-- struct_ops (5.6)
-- Sleepable BPF (5.10)
+### What we discovered (vs. what we planned)
 
-See [`docs/research/2026-04-28-ebpf-feature-survey.md`](research/2026-04-28-ebpf-feature-survey.md) for the planned scope.
+**Plan was:** cherry-pick 5 patch series into 4.19 (`bpf_link` 5.7, `bpf_iter` 5.6,
+BPF trampoline 5.5, `struct_ops` 5.6, sleepable BPF 5.10).
+
+**Reality:** CIP-128 already backported all 5 series into 4.19. Source code for
+`bpf_link` (245 references), `bpf_iter`, `kernel/bpf/trampoline.c`,
+`kernel/bpf/bpf_struct_ops.c`, and `BPF_F_SLEEPABLE` is **fully present**.
+Verified by survey + runtime probe — see
+`workspace/kernel/patches/phase2-bpf-backport/00-survey/STRATEGY.md`.
+
+The only thing blocking `tracing`/`lsm`/`ext` was the verifier requiring
+`btf_vmlinux` to be populated, which traditionally comes from the in-kernel
+`.BTF` section produced by `CONFIG_DEBUG_INFO_BTF=y`. That config adds 10MB
+to the kernel Image and alioth's bootloader silently rejects it.
+
+### The fix — BTF firmware loader (50 lines)
+
+Patched `kernel/bpf/btf.c` and `kernel/bpf/verifier.c` to load BTF lazily from
+the filesystem when the in-kernel `.BTF` section is empty:
+
+```c
+/* in btf_parse_vmlinux() */
+if (btf->data_size == 0) {           // no .BTF section
+    err = ksu_btf_load_from_fs(...); // try /vendor/firmware, /lib/firmware,
+                                     // /data/local/tmp/vmlinux.btf
+}
+```
+
+Plus four supporting changes:
+- Drop `IS_ENABLED(CONFIG_DEBUG_INFO_BTF)` guard in `bpf_get_btf_vmlinux()`
+- Free vmalloc'd buffer on errout (avoid 10MB-per-failure leak)
+- Skip missing file-static structs in `btf_vmlinux_map_ids_init()` (e.g.
+  `bpf_shtab` that pahole optimizes out) instead of failing the whole init
+- Rate-limit retries (5 sec) when parse fails, prevent OOM spin loops
+
+Kernel Image size **unchanged** — the 10MB BTF lives in `/data/local/tmp/`.
+
+### BTF generation — 4.19-strict
+
+```bash
+pahole -J --btf_features=encode_force,reproducible_build,var out/vmlinux
+llvm-objcopy --dump-section=.BTF=vmlinux.btf out/vmlinux
+```
+
+Critical: do **not** include `--btf_gen_floats` or `--btf_gen_all`.
+4.19's parser only knows BTF kinds 1-15 (UNKN..DATASEC). FLOAT (16),
+DECL_TAG (17), TYPE_TAG (18), ENUM64 (19) all trigger `btf_check_all_metas`
+EINVAL.
+
+### Result (`bpftool feature probe`)
+
+| Prog type | Before P2 | After P2 |
+|---|---|---|
+| `tracing` (fentry/fexit/raw_tp_writable) | NOT available | **available** ✅ |
+| `lsm` (BPF_PROG_TYPE_LSM) | NOT available | **available** ✅ |
+| `ext` (program extensions) | NOT available | **available** ✅ |
+| `struct_ops` | available | available |
+| 25 other prog types | available | available |
+| `syscall` (5.14+) / `netfilter` (6.x) | NOT | NOT (requires source backport) |
+| `lirc_mode2` | NOT | NOT (no IR hardware) |
+
+dmesg evidence:
+```
+btf: loaded vmlinux BTF from /data/local/tmp/vmlinux.btf (9762784 bytes)
+btf: btf_parse_vmlinux SUCCESS, 188258 types
+```
+
+No regressions — 60+ existing BPF programs (NetBpfLoad, gpuMem, netd, ringbuf
+test) continue working. KSU manager / ftrace / kprobe all unaffected.
+
+Full details: [`docs/runbook/2026-04-28-btf-firmware-loader.md`](runbook/2026-04-28-btf-firmware-loader.md).
+Survey + strategy: `workspace/kernel/patches/phase2-bpf-backport/00-survey/STRATEGY.md`.
+
+## Future work (out of scope)
+
+- `BPF_PROG_TYPE_SYSCALL` (5.14+) — source-level backport (~hundreds of lines, verifier changes)
+- `BPF_PROG_TYPE_NETFILTER` (6.x) — source-level backport
+- Bake BTF into `/vendor/firmware/` so it survives factory reset (currently in `/data/local/tmp/`, lost on data wipe)
+- Address remaining file-static struct gaps in BTF (e.g. `bpf_shtab`) by making them externally referenced
