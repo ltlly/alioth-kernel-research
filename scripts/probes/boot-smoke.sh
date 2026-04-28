@@ -5,8 +5,8 @@ set -uo pipefail
 
 fail() { echo "PROBE FAIL: $*"; exit 1; }
 
-# uname must show our kernel string (KBUILD_BUILD_USER=claude)
-adb shell uname -a 2>/dev/null | grep -q "claude" || fail "uname does not show 'claude' (rebuild marker)"
+# /proc/version embeds KBUILD_BUILD_USER (uname -a does not). Confirm our build.
+adb shell cat /proc/version 2>/dev/null | grep -q "claude@research" || fail "/proc/version does not show 'claude@research' (rebuild marker)"
 
 # Basic adb features
 adb shell id | grep -q "uid=0" || fail "adb not root"
