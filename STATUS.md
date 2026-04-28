@@ -6,13 +6,14 @@
 | Phase 0 (vanilla) | DONE | NDK r29 clang r563880c match for stock; vermagic identical |
 | Phase 1 (BTF+ftrace+KSU) | **🏆 完整功能 — Manager「工作中 ✓」** | KSU v3.2.4 全集成: 16 个 KSU 文件 patch + 真实 supercall dispatch + apk_sign 验证我们 fork 的 manager; 「Crowning manager」+ 「工作中 ✓」<GKI> 状态; 4 个 tab 全可用 |
 | Phase 2 (BPF backport) | **🏆 tracing+lsm+ext 解锁** | CIP 已 backport bpf_link/iter/trampoline/struct_ops/sleepable; 我们 patch btf.c+verifier.c 增加 BTF firmware 加载（绕开 alioth 的 64MB Image 限制）→ 29/32 prog types available。仅 `syscall` / `netfilter` 真正缺（5.14+/6.x） |
-| Phase 2 R3 (WITH_REGS) | **🏆 fentry args 可读 (x1..x7)** | arm64 mcount-based ftrace 上 backport `HAVE_DYNAMIC_FTRACE_WITH_REGS` (~200 LOC asm + C)。BPF fentry 程序现在能读到真实 `regs->regs[1..7]`（即函数参数 1..7）。`regs->regs[0]` 仍是 parent_pc — mcount ABI 硬限制，无法绕开 |
+| Phase 2 R3 (WITH_REGS hack, 已废弃) | 撤销 | 旧的 mcount-based 实现已 revert |
+| **Phase 2 R4 (mainline 5.5/5.18 移植)** | **🏆 完整标准 eBPF: fentry/fexit/return-value** | 移植 mainline 5.5 `3b23e4991fb6` (-fpatchable-function-entry=2) + 5.18 `f64dd4627ec6` (register_ftrace_direct_multi) + arm64 ABI bridge in `ftrace_common_return`. 现在 `ctx[0..N]` 是真实参数，fexit 在 ret 后触发，能读 return value。完全和 upstream 一致 |
 
 ## Current device state
 
-- Active slot: `_a` flashed with **P2 R3 kernel** (P1 + BTF FW loader + WITH_REGS backport) — persistent
-- Persistent image: `workspace/builds/20260429-002039-p2-with-regs3.img`
-- Kernel: `Linux 4.19.325-cip128-st12-perf-g8ccba43d1805-dirty #45 ... 00:20:19`
+- Active slot: `_a` flashed with **P2 R4 kernel** (P1 + BTF FW + 5.5/5.18 mainline ports) — persistent
+- Persistent image: `workspace/builds/20260429-024852-p2-fexit-clean.img`
+- Kernel: `Linux 4.19.325-cip128-st12-perf-g6aa1a1ec0463-dirty #56 ... 02:48:54`
 - `/proc/version` shows `(claude@research)` — our build
 - KSU module: loaded, feature handlers registered, manager 工作中 ✓
 - BTF file at `/data/local/tmp/vmlinux.btf` (9.7MB strict-4.19, no FLOAT/ENUM64/etc) — required at runtime for tracing/lsm/ext
@@ -108,7 +109,44 @@ $ ls / ; cat /sys/kernel/tracing/trace
   ... 451 events captured in <1s
 ```
 
-### Phase 2 Round 3: HAVE_DYNAMIC_FTRACE_WITH_REGS backport (kernel commit `2f9a02d7877f`)
+### Phase 2 Round 4: 完整 mainline 移植，达成标准 eBPF 行为
+
+通过移植 mainline 5.5 + 5.18 三个上游 commit 实现完全标准的 BPF fentry/fexit/return-value 语义：
+
+| 上游 commit | 功能 | 我们的 commit |
+|---|---|---|
+| Linux 5.5 `fbf6c73c5b26` | `ftrace_init_nop` weak callback | `ee041ac767d3` |
+| Linux 5.5 `3b23e4991fb6` | arm64 ftrace_with_regs (`-fpatchable-function-entry=2`) | `15491ac9ca5d` |
+| Linux 5.18 `f64dd4627ec6` | `register_ftrace_direct_multi` API | `a89e06fd2f44` |
+| Linux 6.0 `efc9909fdce0` (前已移植) | BPF arm64 trampoline JIT | `9a7c71dabb06` |
+| 这次新增 | arm64 `ftrace_common_return` ABI bridge (`pt_regs->orig_x0` 直接调用重定向) | `9b69f0d293a4` |
+| 这次新增 | BPF JIT: 不跳过 bpf_func 当 `__bpf_prog_enter` 返回 0（4.19 语义） | `6aa1a1ec0463` |
+| 这次新增 | BPF trampoline 改用 direct_multi，删除 ksu_adapter | `549c996be470` |
+
+✅ **Validated live (cold reboot from slot _a)**:
+```
+$ adb shell bpftool prog loadall fexit_test.bpf.o /sys/fs/bpf/y autoattach
+$ adb shell cat /sys/kernel/tracing/enabled_functions
+do_sys_open (1) R I D    tramp: ftrace_regs_caller (call_direct_funcs)
+                         direct--> bpf_trampoline_105579_1
+
+$ ls /
+$ echo z > /data/local/tmp/cold.txt
+$ adb shell cat /sys/kernel/tracing/trace
+sh ENTRY  dfd=ffffffffffffff9c flags=20241                     # AT_FDCWD, real flags
+sh EXIT   dfd=ffffffffffffff9c flags=20241 ret=3               # 真实 ret value (fd 3)
+ls ENTRY  dfd=ffffffffffffff9c flags=a8000
+ls EXIT   dfd=ffffffffffffff9c flags=a8000 ret=3
+```
+
+**完全标准 eBPF 接口**：
+- `ctx[0..N]` = 函数实际参数 0..N (含 arg0 — AT_FDCWD = -100) ✓
+- fentry 触发于函数入口 ✓
+- fexit 触发于函数 ret 之后 ✓
+- fexit 读 return value ✓
+- fmod_ret 改 return value（mainline JIT 已支持，自动可用） ✓
+
+### Phase 2 Round 3 (deprecated): HAVE_DYNAMIC_FTRACE_WITH_REGS hack (commit `2f9a02d7877f`, 已 revert)
 
 ✅ **arm64 4.19 mcount-based WITH_REGS** (~200 LOC asm + C)
 - `arch/arm64/include/asm/ftrace.h`: `ARCH_SUPPORTS_FTRACE_OPS 1`

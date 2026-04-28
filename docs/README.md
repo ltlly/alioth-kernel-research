@@ -17,7 +17,8 @@
 - [`runbook/2026-04-28-ksu-patches.md`](runbook/2026-04-28-ksu-patches.md) — **每个 KSU 文件改动的详细解释**
 - [`runbook/2026-04-28-btf-firmware-loader.md`](runbook/2026-04-28-btf-firmware-loader.md) — **Phase 2 Round 1: tracing/lsm/ext verifier-level 解锁**
 - [`runbook/2026-04-28-arm64-bpf-trampoline.md`](runbook/2026-04-28-arm64-bpf-trampoline.md) — **Phase 2 Round 2: arm64 trampoline JIT + ftrace_function 适配器（fentry 真正 fire）**
-- [`runbook/2026-04-29-arm64-ftrace-with-regs.md`](runbook/2026-04-29-arm64-ftrace-with-regs.md) — **Phase 2 Round 3: HAVE_DYNAMIC_FTRACE_WITH_REGS backport（fentry 程序读到真实 x1..x7 函数参数）**
+- [`runbook/2026-04-29-arm64-ftrace-with-regs.md`](runbook/2026-04-29-arm64-ftrace-with-regs.md) — Phase 2 Round 3 (deprecated): mcount-based WITH_REGS hack — has been replaced by Round 4
+- [`runbook/2026-04-29-mainline-direct-multi-port.md`](runbook/2026-04-29-mainline-direct-multi-port.md) — **Phase 2 Round 4: mainline 5.5+5.18 BPF trampoline 完整移植（标准 eBPF: fentry/fexit/return value）**
 - [`runbook/2026-04-28-recovery-runbook.md`](runbook/2026-04-28-recovery-runbook.md) — **设备砖了怎么救**
 
 ### Phase 2 patch + 工件

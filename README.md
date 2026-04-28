@@ -18,7 +18,8 @@ KernelSU upstream officially [dropped non-GKI support starting v1.0](https://ker
 - ✅ **Phase 1** (BTF + ftrace + KSU manager working) — DONE
 - ✅ **Phase 2 Round 1** (BTF firmware loader → tracing/lsm/ext verifier-level) — DONE
 - ✅ **Phase 2 Round 2** (arm64 trampoline JIT + ftrace_function adapter → fentry actually fires) — DONE — 451 events/sec captured live
-- ✅ **Phase 2 Round 3** (HAVE_DYNAMIC_FTRACE_WITH_REGS backport → fentry programs read real x1..x7 function args) — DONE — verified flags=0x20241/0xa8000, mode=0666 live
+- ✅ **Phase 2 Round 3** (HAVE_DYNAMIC_FTRACE_WITH_REGS backport, deprecated/reverted) — replaced by Round 4
+- ✅ **Phase 2 Round 4** (mainline 5.5+5.18 BPF trampoline complete port → standard eBPF fentry/fexit/return-value) — DONE — `ctx[0]=AT_FDCWD`, `fexit ret=3`, behavior 100% identical to upstream 6.x
 
 ## Quick navigation
 
