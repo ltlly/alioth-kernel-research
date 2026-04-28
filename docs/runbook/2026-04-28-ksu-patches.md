@@ -238,38 +238,88 @@ void ksu_file_wrapper_init(void) { /* no-op */ }
 
 ---
 
-### 7. `selinux/selinux.c`：current_sid 重定义
+### 7. `selinux/selinux.c`：4.19 真实实现（非 stub）
 
-**Why:** SELinux 子系统在 Linux 5.7 大重构。包括 `current_sid()` 等 helper 在内的命名空间变化。4.19 的 `current_sid` 来自 SELinux 自己的 hooks.c，KSU 又自己定义一遍 → 重定义错误。
+**Why:** SELinux 子系统在 Linux 5.7 大重构（state.policy / RCU policy derefs / current_sid 重定义）。
 
-**How:**
+**How:** 4.19 自己的 SELinux API 实际**绝大多数都还在**——只是 KSU 上游用的 `selinux_state.policy` 在 4.19 是 `selinux_state.ss`。所以**不需要 stub，只需要不用那条路径**：
+
 ```c
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
-[原 222 行]
+[原 222 行：依赖 transive_to_domain + state.policy 等 5.7+ helpers]
 #else
-/* 4.x: 完全 stub 掉 SELinux 集成 */
+/* 4.x 真实实现 — 用 4.19 自己的 SELinux API */
 #include <linux/cred.h>
-#include "selinux.h"
+#include <linux/sched.h>
+#include <linux/string.h>
+#include <linux/capability.h>
+#include "objsec.h"  /* 4.19 selinux_cred() */
+
+extern struct selinux_state selinux_state;
+extern const struct cred *ksu_cred;
+
+static u32 cached_su_sid, cached_zygote_sid, cached_init_sid;
 u32 ksu_file_sid __read_mostly = 0;
-void setup_selinux(...) { }
-void setenforce(bool e) { (void)e; }
-bool getenforce(void) { return false; }
-void cache_sid(void) { }
-bool is_task_ksu_domain(...) { return false; }
-bool is_ksu_domain(void) { return false; }
-bool is_zygote(...) { return false; }
-bool is_init(...) { return false; }
-void setup_ksu_cred(void) { }
-void escape_to_root_for_adb_root(void) { }
+
+void cache_sid(void) {
+    security_secctx_to_secid(KERNEL_SU_CONTEXT, ..., &cached_su_sid);
+    security_secctx_to_secid(ZYGOTE_CONTEXT, ..., &cached_zygote_sid);
+    security_secctx_to_secid(INIT_CONTEXT, ..., &cached_init_sid);
+    security_secctx_to_secid(KSU_FILE_CONTEXT, ..., &ksu_file_sid);
+}
+
+void setup_selinux(const char *domain, struct cred *cred) {
+    u32 sid;
+    if (security_secctx_to_secid(domain, strlen(domain), &sid) == 0 && sid) {
+        struct task_security_struct *tsec = selinux_cred(cred);
+        tsec->sid = sid;
+        tsec->osid = sid;
+        tsec->exec_sid = sid;
+    }
+}
+
+void setenforce(bool enforcing) { enforcing_set(&selinux_state, enforcing); }
+bool getenforce(void) { return enforcing_enabled(&selinux_state); }
+
+bool is_task_ksu_domain(const struct cred *cred) {
+    if (cached_su_sid == 0) return false;
+    return selinux_cred(cred)->sid == cached_su_sid;
+}
+/* is_zygote / is_init / is_ksu_domain — same pattern */
+
+void setup_ksu_cred(void) {
+    cache_sid();
+    if (ksu_cred && cached_su_sid != 0) {
+        struct task_security_struct *tsec = selinux_cred((struct cred *)ksu_cred);
+        tsec->sid = tsec->osid = tsec->exec_sid = cached_su_sid;
+    }
+}
+
+void escape_to_root_for_adb_root(void) {
+    struct cred *new = prepare_creds();
+    new->uid.val = new->euid.val = new->fsuid.val = new->suid.val = 0;
+    new->gid.val = new->egid.val = new->fsgid.val = new->sgid.val = 0;
+    memset(&new->cap_inheritable, 0xff, sizeof(new->cap_inheritable));
+    /* ... 全部 cap set 都给 ... */
+    if (cached_su_sid != 0) {
+        struct task_security_struct *tsec = selinux_cred(new);
+        tsec->sid = tsec->osid = tsec->exec_sid = cached_su_sid;
+    }
+    commit_creds(new);
+}
 #endif
 ```
 
-**Limitation:** 这是最大的妥协。KSU 不能：
-- 切换到 KSU SELinux domain（"ksu"）
-- 跟 Android SELinux state 联动
-- 检测进程是否已经 zygote / init
+**Limitation:** 一个：**未修改的 Android SELinux policy 没有 `u:r:ksu:s0` 这个类型**——所以 `security_secctx_to_secid` 查询返回 sid=0，`is_ksu_domain` 等检查永远为 false，escalate 时 cred 的 SID 无变化。
 
-「app 通过 KSU manager 申请 root」的 SELinux 域转换路径完全不工作。`adb root` 不依赖 SELinux 域，所以仍可用。
+**功能影响：**
+- ✅ uid/gid 升级 + 全权能 → 工作
+- ✅ enforce/getenforce 控制 → 工作
+- ✅ SID 缓存机制 → 工作（只是 ksu_sid=0）
+- ⚠️ MAC context 不变 → SELinux 在 enforcing 模式可能拒绝某些访问
+- 📋 解决：userdebug ROM 上 `setenforce 0` 即可（已验证 4.19 上的 setenforce 通过我们的 wrapper 工作）
+
+**真要完整无 setenforce 0：** 需要做 sepolicy.c 的 4.19 版本，运行时往 SELinux policy 里塞 `ksu` type 和宽容规则。这需要写 4.19 policydb 操作（`selinux_state.ss->policydb` 而非 5.7 的 `state.policy.policydb`）—— 工作量大概 1-2 天。
 
 ---
 
