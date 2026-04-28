@@ -33,7 +33,7 @@
 
 ---
 
-## 11 个被改的文件
+## 17 个被改的文件（含最终修复）
 
 ### 0. ⭐ `hook/arm64/patch_memory.c`：pmd_leaf / pud_leaf 兼容（关键修复！）
 
@@ -442,14 +442,76 @@ static inline int path_umount(struct path *path, int flags) { return -ENOSYS; }
 #endif
 ```
 
-#### `Kbuild` (KSU)
+#### `manager/pkg_observer.c`：fsnotify_ops 4.x 兼容（最终方案）
 
-**改动：** 将 `manager/` 子目录的 .o 用 `KSU_DISABLE_MANAGER=y` 跳过，避免修 `pkg_observer.c` 里的 fsnotify_ops 不兼容。
+**Why:** 5.10+ 用 `handle_inode_event(mark, mask, inode, dir, qstr_filename, cookie)`；4.19 用 `handle_event(group, inode, mask, data, data_type, char*_filename, cookie, iter_info)`。签名差异大。
 
-**修改 defconfig overlay:**
+**How（取代之前的 `KSU_DISABLE_MANAGER=y` workaround）:**
+```c
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask, ...) { /* 原版 */ }
+static const struct fsnotify_ops ksu_ops = { .handle_inode_event = ksu_handle_inode_event };
+#else
+static int ksu_handle_event_419(struct fsnotify_group *group, struct inode *inode,
+                                u32 mask, const void *data, int data_type,
+                                const unsigned char *file_name, u32 cookie,
+                                struct fsnotify_iter_info *iter_info) {
+    if (!file_name) return 0;
+    if (mask & FS_ISDIR) return 0;
+    if (strnlen((const char*)file_name, 64) == 13 && !memcmp(file_name, "packages.list", 13))
+        track_throne(false);
+    return 0;
+}
+static const struct fsnotify_ops ksu_ops = { .handle_event = ksu_handle_event_419 };
+#endif
+```
+
+**Limitation:** 无功能损失。
+
+#### ⭐ `manager/apk_sign.c`：CERT_MAX_LENGTH 1024→2048（解锁 RSA-4096）
+
+**Why:** 原 `check_block()` 用 1024 字节栈缓冲读取证书。RSA-2048 证书 ~744 字节合规，但 RSA-4096 证书 1313 字节会超出限制，函数静默返回 false → manager 永远 `is_manager: 0`。
+
+**How:**
+```c
+/* Bumped from 1024 to 2048 to fit RSA-4096 certs (which are ~1313 bytes).
+ * Upstream KSU used RSA-2048 (~744 bytes), well under 1024. Our research
+ * fork uses RSA-4096 stable keystore so we need the larger buffer. */
+#define CERT_MAX_LENGTH 2048
+char cert[CERT_MAX_LENGTH];
+```
+
+**Limitation:** 内核栈空间多用 1KB（在大部分 arch 默认 8K-16K 栈下完全 OK）。
+
+#### `kernel/Kbuild`：稳定签名 EXPECTED_SIZE/HASH
+
+**Why:** GitHub Actions 默认 gradle debug keystore 每次跑都不同 → APK 签名 hash 每次都变 → 永远 mismatch。
+
+**How:**
+1. 本地生成 stable keystore（RSA-4096，10000 天有效期）：
+   ```bash
+   keytool -genkeypair -alias ksu-research -keyalg RSA -keysize 4096 \
+     -validity 36500 -dname "CN=alioth-4.19-research" \
+     -storepass alioth-research-2026 -storetype JKS -keystore ksu-stable.jks
+   ```
+2. base64-encode 后通过 `gh secret set KEYSTORE` 存入 GH 仓库 secret
+3. CI 的 `Write key` 步骤检测 `secrets.KEYSTORE` 非空时自动用我们的 keystore
+4. Kbuild 中：
+   ```
+   KSU_EXPECTED_SIZE := 0x0521  # 1313 bytes (RSA-4096 cert)
+   KSU_EXPECTED_HASH := 1829a3c8d06a781b7c819c99454a22a9e0595b975028640d3244fb65ad2e4009
+   # 备份保留 upstream KSU 的 hash 让用户也能装 release APK：
+   KSU_EXPECTED_SIZE2 := 0x033b
+   KSU_EXPECTED_HASH2 := c371061b19d8c7d7d6133c6a9bafe198fa944e50c1b31c9d8daa8d7f1fc2d2d6
+   ```
+
+**Limitation:** 我们的 keystore 公开在 GH secret 中（仅 repo owner 可读）。研究内核可接受；商用产品需更严格的密钥管理。
+
+#### defconfig overlay 简化（取消 KSU_DISABLE_MANAGER）
+
 ```
 CONFIG_KSU=y
-CONFIG_KSU_DISABLE_MANAGER=y    # 跳过 pkg_observer (handle_inode_event 5.10+)
+# CONFIG_KSU_DISABLE_MANAGER 已不再需要（pkg_observer.c 已 4.x 兼容）
 ```
 
 #### `scripts/link-vmlinux.sh`（kernel 主源码，非 KSU）
