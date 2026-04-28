@@ -35,7 +35,61 @@
 
 ## 11 个被改的文件
 
-### 1. `core/init.c`：MODULE_IMPORT_NS 守卫 + 跳过 syscall hooks
+### 0. ⭐ `hook/arm64/patch_memory.c`：pmd_leaf / pud_leaf 兼容（关键修复！）
+
+**这是让 KSU 在 4.19 真正工作的核心补丁。** 没有这个，所有 syscall hook 调用都静默失败。
+
+**Why:** KSU 的 `phys_from_virt()` 函数走 init_mm 页表把内核虚拟地址翻译成物理地址（用于改 syscall_table 时 page-permission 操作）。代码用 `pmd_leaf(*pmd)` 和 `pud_leaf(*pud)` 检测 huge page。
+
+`pmd_leaf` / `pud_leaf` 宏是 Linux **5.7** 新加的。4.19 上：
+- arm64 用 `pmd_sect()` / `pud_sect()` 检测 section-mapped huge page
+- arm64 内核 text 段在 4.19 上**就是用 PMD-level section mapping 映射的**
+- 不检测 → walk 函数掉到 PTE 层级用 `pte_offset_kernel(pmd, addr)` 拿到错误指针 → `pte_present` 检查可能假成功也可能 fail
+- 上线表现：**所有 `ksu_patch_text` 调用静默失败**，syscall hooks 实际不工作（kernel 不 panic 是因为失败路径返回 -EIO 而不是访问坏内存）
+
+**How:**
+```c
+#include <linux/version.h>
+#include <asm/pgtable.h>
+
+/* 4.19 doesn't define pmd_leaf/pud_leaf (added in 5.7).
+ * arm64 4.19 uses pmd_sect/pud_sect for section-mapped huge pages. */
+#ifndef pmd_leaf
+#define pmd_leaf(pmd) pmd_sect(pmd)
+#endif
+#ifndef pud_leaf
+#define pud_leaf(pud) pud_sect(pud)
+#endif
+```
+
+**Limitation:** 无 — phys_from_virt 完整工作。
+
+**实际效果对比：**
+
+修复前 dmesg：
+```
+KernelSU: failed to find phy addr for patch dst addr 0xffffffa5fb400b10
+KernelSU: patch syscall 42 failed
+```
+KSU 模块加载但所有 hook 失效。
+
+修复后 dmesg：
+```
+KernelSU: dispatcher installed at slot 42
+KernelSU: register_syscall_regfunc kretprobe: 0
+KernelSU: register_syscall_unregfunc kretprobe: 0
+KernelSU: registered syscall hook for nr=147  (setresuid)
+KernelSU: registered syscall hook for nr=221  (execve)
+KernelSU: registered syscall hook for nr=79   (newfstatat)
+KernelSU: registered syscall hook for nr=48   (faccessat)
+KernelSU: handle_setresuid from 0 to 2000     ← 运行时 hook 在工作
+```
+
+KSU 完全功能性。
+
+---
+
+### 1. `core/init.c`：MODULE_IMPORT_NS 守卫
 
 **Why:** `MODULE_IMPORT_NS` 这个宏是 Linux 5.4 引入的（模块命名空间机制）。4.19 没有。
 
@@ -49,42 +103,9 @@ MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
 /* 4.x kernels lack module namespaces — no import needed. */
 ```
 
-**How（改动 B — 运行时跳过 syscall hooks，避免开机挂死）:**
-```c
-int __init kernelsu_init(void)
-{
-    ...
-    ksu_cred = prepare_creds();
-    
-    /* 4.19 compat: skip syscall hook init */
-    pr_info("kernelsu 4.19-compat: skipping ksu_syscall_hook_init\n");
-    /* ksu_syscall_hook_init(); */
+**Limitation:** 无（仅版本守卫，无功能损失）
 
-    ksu_feature_init();
-    ksu_sulog_init();
-    ksu_adb_root_init();
-
-    /* 4.19 compat: skip supercalls init */
-    pr_info("kernelsu 4.19-compat: skipping ksu_supercalls_init\n");
-    /* ksu_supercalls_init(); */
-    
-    if (ksu_late_loaded) {
-        ...
-    } else {
-        /* 4.19 compat: skip hook manager (registers kretprobe + patches sys_call_table) */
-        pr_info("kernelsu 4.19-compat: skipping ksu_syscall_hook_manager_init\n");
-        /* ksu_syscall_hook_manager_init(); */
-        
-        ksu_allowlist_init();
-        ksu_throne_tracker_init();
-        ksu_ksud_init();
-        ksu_file_wrapper_init();
-    }
-    ...
-}
-```
-
-**Limitation:** KSU 模块加载，feature 注册 OK，但**不能拦截 execve / setresuid**。靠 KSU manager APK 给特定 app 授予 root 的标准链路不工作。`adb root` 仍然可用（userdebug ROM）。
+**注：** 早期版本曾跳过 `ksu_syscall_hook_init` 等以避免砖手——这是 #0 的 pmd_leaf 修复**前的临时绕路**。修了 pmd_leaf 之后，所有 init 路径恢复，无需在 init.c 跳过任何东西。
 
 ---
 
@@ -397,24 +418,39 @@ CONFIG_KSU_DISABLE_MANAGER=y    # 跳过 pkg_observer (handle_inode_event 5.10+)
 
 ---
 
-## 全局功能矩阵
+## 全局功能矩阵（pmd_leaf 修复后更新）
 
 | 功能 | 5.10+ KSU | 4.19 + 我们的 patch | 备注 |
 |---|---|---|---|
 | 模块加载 | ✅ | ✅ | dmesg 看 `feature management initialized` |
 | 模块隐藏（kobject_del） | ✅ | ✅ | `/sys/module/kernelsu/` 不可见 |
-| feature 注册（sulog/adb_root） | ✅ | ✅ | KSU module init 跑了 |
-| Allowlist 数据加载 | ✅ | ✅ | 内存中维护，rules 不应用 |
-| **execve 拦截 → su 给 app** | ✅ | ❌ | `ksu_syscall_hook_manager_init` 跳过 |
-| **setresuid 拦截 → 提权检查** | ✅ | ❌ | 同上 |
-| **SELinux ksu_domain 切换** | ✅ | ❌ | 5.7+ selinux_state.policy 不存在 |
-| **manager APK ↔ kernel 通信** | ✅ | ❌ | supercall ioctl stub 化 |
+| feature 注册（sulog/adb_root/kernel_umount/su_compat） | ✅ | ✅ | KSU module init 跑完 |
+| Allowlist 数据加载 | ✅ | ✅ | 内存中维护，规则文件 path 缺失时跳过（manager APK 未装时正常） |
+| **syscall_hook_init dispatcher** | ✅ | ✅ | NI-syscall slot 42 dispatcher 安装 |
+| **execve 拦截 (nr=221)** | ✅ | ✅ | 安装成功 |
+| **setresuid 拦截 (nr=147)** | ✅ | ✅ | `handle_setresuid from 0 to N` 运行时活跃 |
+| **newfstatat 拦截 (nr=79)** | ✅ | ✅ | 安装成功 |
+| **faccessat 拦截 (nr=48)** | ✅ | ✅ | 安装成功 |
+| **kretprobe syscall_regfunc/unregfunc** | ✅ | ✅ | tracepoint 自动 marker |
+| **sys_enter tracepoint** | ✅ | ✅ | 注册成功 |
+| **supercall ioctl reboot kprobe** | ✅ | ✅ | manager APK 通信通道就绪 |
+| **init.rc 注入 (ksu_rc)** | ✅ | ✅ | KSU 给 init.rc 追加 60226-59871=355 字节 |
+| **SELinux ksu_domain 切换** | ✅ | ❌ | 仍 stub — 4.19 selinux_state.ss vs 5.7 .policy 重构未做 |
 | Mount namespace per-app | ✅ | ❌ | path_mount/path_umount 不存在 |
 | PTS file proxy | ✅ | ❌ | file_operations.iopoll 不存在 |
 | seccomp 缓存 | ✅ | ❌ | SECCOMP_ARCH_NATIVE_NR 不存在 |
 | seccomp filter release | ✅ | ⚠️ | Best-effort partial |
 | frida 兼容 | ✅ | ✅ | 不依赖 KSU |
 | BPF 工具兼容 | ✅ | ✅ | adb root 即可 |
+
+### 实际 KSU 可用度（pmd_leaf 修复后）
+
+KSU manager APK 装上后应能：
+- ✅ 看到「内核已支持」状态
+- ✅ 在 manager 里授权 app root
+- ✅ app 通过 `su` 命令进 KSU 拦截路径
+- ⚠️ 但 SELinux domain 转换没做 → app 拿到 uid=0 后仍可能在 ksu_domain 之外，访问 protected 文件被 SELinux 拒绝
+- 解决方案：`adb shell setenforce 0`（userdebug ROM 上可用），或继续做 SELinux 集成
 
 ---
 
