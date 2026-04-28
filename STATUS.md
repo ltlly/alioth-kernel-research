@@ -42,24 +42,52 @@ that's the 5-second-rate-limit retry path. Recovery is automatic; no functional 
 ✅ frida unaffected (no kernel dependency)
 ✅ adb root persists (userdebug ROM)
 
-## What works in Phase 2 (BTF firmware loader)
+## What works in Phase 2 (BTF firmware loader) — partial unlock
 
-✅ **`tracing` prog type** (fentry/fexit/raw_tp_writable) — newly available
-✅ **`lsm` prog type** (BPF_PROG_TYPE_LSM) — newly available
-✅ **`ext` prog type** (program extensions) — newly available
-✅ **`struct_ops`** (already worked in P1 source, now also verified at runtime)
-✅ **All 18 BPF map types** including ringbuf/sockhash/devmap/cpumap/xskmap
-✅ in-kernel `btf_vmlinux` populated from `/data/local/tmp/vmlinux.btf` via `kernel_read_file_from_path()`
-✅ NetBpfLoad / gpuMem / netd / ringbuf — 60+ existing BPF programs continue running unaffected
+### Verifier-level (load + verify)
+✅ **`tracing` prog type** — verifier accepts and JITs (P2 unlock via BTF)
+✅ **`lsm` prog type** — verifier accepts and JITs
+✅ **`ext` prog type** — verifier accepts and JITs
+✅ **`struct_ops`** — full
+✅ in-kernel `btf_vmlinux` populated from `/data/local/tmp/vmlinux.btf`
+✅ `/sys/kernel/btf/vmlinux` exposed for userspace libbpf (after P2v2 patch)
+✅ All 18 BPF map types
+✅ NetBpfLoad / gpuMem / netd / ringbuf — 60+ existing BPF programs unaffected
 
-⚠️ `syscall` (5.14+) and `netfilter` (6.x) prog types — not backported, would need source-level work
+### Attach-level for tracing/lsm/ext — ⚠️ BLOCKED
+**Cannot attach `tracing` / `lsm` / `ext` programs to kernel functions** because
+`arch_prepare_bpf_trampoline()` is the `__weak` default in 4.19-cip and returns
+`-ENOTSUPP`. CIP-128 backported the trampoline framework but not the arm64
+specific assembler (upstream Linux 6.0 commit `efc9909fdce0`, Aug 2022).
+
+```
+$ bpftool prog loadall fentry_test.bpf.o /sys/fs/bpf/x autoattach
+libbpf: prog 'trace_open': failed to attach: Unknown error 524
+```
+
+`-ENOTSUPP = 524` is from `kernel/bpf/trampoline.c:552`.
+
+**What still works fully** (real-world hooking):
+- ✅ uprobe + tracefs (kernel 4.19 base) — verified live on `Ena1907_req`
+- ✅ kprobe + tracefs / kprobe BPF prog type — 19 programs running
+- ✅ BPF tracepoint, raw_tracepoint, perf_event, sched_cls, etc. — 26 prog types
+- ✅ frida / stackplz / bpftrace (uprobe/kprobe subset)
+
+⚠️ `syscall` (5.14+) and `netfilter` (6.x) prog types — not backported
 
 ### The BTF firmware loader patch
 
-`kernel/bpf/btf.c::btf_parse_vmlinux()` + `kernel/bpf/verifier.c::bpf_get_btf_vmlinux()`:
+`kernel/bpf/btf.c::btf_parse_vmlinux()` + `kernel/bpf/verifier.c::bpf_get_btf_vmlinux()` +
+`kernel/bpf/sysfs_btf.c` (lazy /sys/kernel/btf/vmlinux):
 当 `__start_BTF == __stop_BTF`（无 .BTF section）时，从 FS 加载 BTF 文件。
 绕开 alioth bootloader 的 ~64MB Image 大小限制——内核 Image 零增长。
 完整说明: `docs/runbook/2026-04-28-btf-firmware-loader.md`
+
+### Phase 2 Round 2: arm64 BPF trampoline backport (in progress)
+
+To unlock fentry/fexit/lsm attachment, need to backport upstream Linux 6.0+'s
+arm64 trampoline assembler (`arch_prepare_bpf_trampoline()` + `bpf_arch_text_poke()`).
+Estimated 600+ lines of arm64 JIT. Tracking: `workspace/kernel/patches/phase2-bpf-backport/01-arm64-trampoline/`
 
 ## KSU on 4.19 — full capability (final state)
 

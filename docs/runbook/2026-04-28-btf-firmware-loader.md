@@ -70,26 +70,62 @@ adb push workspace/kernel/patches/phase2-bpf-backport/00-survey/btf-fw/vmlinux.b
 此时 `/data` 还没挂载——会失败一次。等用户级 `bpftool` 或 fentry 程序运行时，
 `/data/local/tmp/` 已就位，加载成功。
 
-## 验证
+## 验证 + 重要边界
 
-`bpftool feature probe` 输出：
+### `bpftool feature probe`（verifier accept 测试）
 
 ```
-eBPF program_type tracing is available    ← 新解锁
-eBPF program_type ext is available        ← 新解锁
-eBPF program_type lsm is available        ← 新解锁
+eBPF program_type tracing is available    ← P2 解锁 (load + JIT)
+eBPF program_type ext is available        ← P2 解锁 (load + JIT)
+eBPF program_type lsm is available        ← P2 解锁 (load + JIT)
 eBPF program_type struct_ops is available
-eBPF program_type sk_lookup is available
 ... （29 个全部 available）
 eBPF program_type syscall is NOT available    ← 5.14+，未 backport
 eBPF program_type netfilter is NOT available  ← 6.x，未 backport
 ```
 
-dmesg 确认：
+⚠️ **「available」只意味着 verifier 会接受 prog load**，并不代表能 attach 到内核函数。
+
+### 实际 attach 测试（fentry on `do_sys_open`）
+
+```
+$ adb shell '/system/bin/bpftool prog loadall fentry_test.bpf.o /sys/fs/bpf/x autoattach'
+libbpf: prog 'trace_open': failed to attach: Unknown error 524    ← -ENOTSUPP
+Program trace_open does not support autoattach, falling back to pinning
+Error: failed to pin all programs
+```
+
+错误来自 `kernel/bpf/trampoline.c:552`：
+
+```c
+int __weak arch_prepare_bpf_trampoline(...)
+{
+    return -ENOTSUPP;  // 4.19-cip 没有 arm64 specific 实现
+}
+```
+
+CIP-128 把 trampoline 框架（`bpf_trampoline_link_prog` 等）带进 4.19，
+但**没带 arm64 specific 汇编器**——upstream Linux 6.0 commit `efc9909fdce0`
+"bpf, arm64: Implement bpf_arch_text_poke() for arm64"（2022 年 8 月）才加的。
+
+### 实战可用性矩阵（针对 Ena1907_req 等 user-space 函数研究）
+
+| 工具 | 可用性 | 备注 |
+|---|---|---|
+| `frida` | ✅ | ptrace+breakpoint，零 BPF 依赖 |
+| `stackplz` | ✅ | 基于 uprobe + kprobe |
+| `bpftrace uprobe:` | ✅ | userspace 函数 hook |
+| `bpftrace fentry:` | ❌ | 需要 arm64 trampoline |
+| libbpf CO-RE kprobe | ✅ | 19 个 Android 程序在跑 |
+| libbpf CO-RE fentry | ⚠️ | load 可以，attach 不能 |
+| BPF LSM | ⚠️ | 同上 |
+
+dmesg 确认 BTF 框架健康：
 
 ```
 btf: loaded vmlinux BTF from /data/local/tmp/vmlinux.btf (9762784 bytes)
 btf: btf_parse_vmlinux SUCCESS, 188258 types
+btf: /sys/kernel/btf/vmlinux available (9762784 bytes)
 ```
 
 ## 已知限制

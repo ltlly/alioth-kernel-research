@@ -161,13 +161,30 @@ EINVAL.
 
 | Prog type | Before P2 | After P2 |
 |---|---|---|
-| `tracing` (fentry/fexit/raw_tp_writable) | NOT available | **available** ✅ |
-| `lsm` (BPF_PROG_TYPE_LSM) | NOT available | **available** ✅ |
-| `ext` (program extensions) | NOT available | **available** ✅ |
+| `tracing` (fentry/fexit/raw_tp_writable) | NOT available (load fails) | **load + JIT works** ⚠️ attach blocked |
+| `lsm` (BPF_PROG_TYPE_LSM) | NOT available (load fails) | **load + JIT works** ⚠️ attach blocked |
+| `ext` (program extensions) | NOT available (load fails) | **load + JIT works** ⚠️ attach blocked |
 | `struct_ops` | available | available |
 | 25 other prog types | available | available |
 | `syscall` (5.14+) / `netfilter` (6.x) | NOT | NOT (requires source backport) |
 | `lirc_mode2` | NOT | NOT (no IR hardware) |
+
+### ⚠️ Important: P2 unlock is **partial**
+
+`bpftool feature probe` reports tracing/ext/lsm as "available", which means the
+verifier accepts and JITs these prog types. **But attaching them to kernel
+functions still fails** with `-ENOTSUPP` because `arch_prepare_bpf_trampoline()`
+is the `__weak` default in 4.19-cip — CIP-128 backported the trampoline
+framework but not the arm64 specific assembler (upstream Linux 6.0 commit
+`efc9909fdce0`, Aug 2022).
+
+For practical security research on user-space functions (e.g., reverse
+engineering Android apps' native libs), this doesn't matter — uprobe + tracefs
+is the right tool and works since 4.19 base. Verified live on Qunar's
+`libgoblin_6_1_1.so::Ena1907_req` with full register argument capture.
+
+For kernel-space tracing via fentry/fexit, an additional ~600-line arm64
+trampoline backport is needed. Status: in progress (Phase 2 Round 2).
 
 dmesg evidence:
 ```
