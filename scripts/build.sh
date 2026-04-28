@@ -38,8 +38,9 @@ export LLVM=1
 export LLVM_IAS=1
 export KBUILD_BUILD_USER=claude
 export KBUILD_BUILD_HOST=research
-# With AOSP clang, no override flags needed. Kept empty so KCFLAGS is unset
-# to ensure we don't introduce divergence vs stock build.
+# Use the same clang that built the running stock kernel (NDK r29 = r563880c).
+# That clang version produces a working kernel without warning suppression.
+# Keep this empty unless build errors require specific overrides.
 unset KCFLAGS
 
 mkdir -p "$OUT"
