@@ -169,22 +169,75 @@ EINVAL.
 | `syscall` (5.14+) / `netfilter` (6.x) | NOT | NOT (requires source backport) |
 | `lirc_mode2` | NOT | NOT (no IR hardware) |
 
-### ⚠️ Important: P2 unlock is **partial**
+### Phase 2 Round 2 — fentry attach now works for real (committed 2026-04-28 23:36)
 
-`bpftool feature probe` reports tracing/ext/lsm as "available", which means the
-verifier accepts and JITs these prog types. **But attaching them to kernel
-functions still fails** with `-ENOTSUPP` because `arch_prepare_bpf_trampoline()`
-is the `__weak` default in 4.19-cip — CIP-128 backported the trampoline
-framework but not the arm64 specific assembler (upstream Linux 6.0 commit
-`efc9909fdce0`, Aug 2022).
+After Round 1 unlocked the verifier via the BTF firmware loader, Round 2
+plugs in the actual attach mechanism.
 
-For practical security research on user-space functions (e.g., reverse
-engineering Android apps' native libs), this doesn't matter — uprobe + tracefs
-is the right tool and works since 4.19 base. Verified live on Qunar's
-`libgoblin_6_1_1.so::Ena1907_req` with full register argument capture.
+Two kernel commits in `android_kernel_xiaomi_sm8250-bpf-research`:
 
-For kernel-space tracing via fentry/fexit, an additional ~600-line arm64
-trampoline backport is needed. Status: in progress (Phase 2 Round 2).
+| Commit | What |
+|---|---|
+| `9a7c71dabb06` | arm64 BPF trampoline JIT emitter (~500 LOC, backport of upstream Linux 6.0 `efc9909fdce0`) |
+| `8ccba43d1805` | `register_ftrace_function`-based fallback adapter (~150 LOC) when `register_ftrace_direct` returns `-ENOTSUPP` |
+
+Live verification on the persisted slot _a kernel:
+
+```
+$ bpftool prog loadall fentry_test.bpf.o /sys/fs/bpf/x autoattach
+$ bpftool link list
+  1: tracing  prog 77   attach_type trace_fentry
+  2: tracing  prog 79   attach_type trace_fexit
+
+$ ls /
+$ cat /sys/kernel/tracing/trace
+  sh-4443  d..3  49.347528: bpf_trace_printk: fentry do_sys_open flags=0
+  cat-4510 d..3  49.347556: bpf_trace_printk: fentry do_sys_open flags=0
+  batterystats-ha-1993 ... fentry do_sys_open flags=0
+  ... 451 events captured in <1s
+```
+
+### Round 2 implementation in two layers
+
+**Layer A — JIT (commit 9a7c71dabb06)**: implements `arch_prepare_bpf_trampoline()`
+and `bpf_arch_text_poke()` for arm64. Strong-symbol overrides the upstream
+`__weak` stub. Adapted from upstream 6.0 with 4.19's older API
+(`bpf_tramp_progs` instead of `bpf_tramp_links`, `__bpf_prog_enter()`
+takes no args, no run_ctx). Skips PLT and BTI emission.
+
+**Layer B — adapter (commit 8ccba43d1805)**: When the trampoline path is
+gated by `ARCH_SUPPORTS_FTRACE_DIRECT` (which 4.19 arm64 lacks),
+`register_fentry()` falls back to a `register_ftrace_function` adapter
+whose `op->func` is a tiny C handler that walks
+`tr->progs_hlist[BPF_TRAMP_FENTRY]` and calls each prog's `bpf_func`.
+
+### Caveats (4.19 ABI hard limits)
+
+- **Args zero-filled** — 4.19 arm64 has no `HAVE_DYNAMIC_FTRACE_WITH_REGS`,
+  so ftrace doesn't pass pt_regs to the callback. BPF programs that read
+  arg registers (`ctx[0..7]`) get 0. Programs that count, bpf_printk
+  literals, or update maps with constants work fine.
+- **fexit runs at entry** — the adapter is fundamentally a function-entry
+  hook. fexit prog "attaches" (link object is real) but fires at entry.
+- **~100 cycles overhead per call** — goes through `ftrace_caller` → ops
+  list → C dispatcher (vs ~10 cycles native DIRECT_CALLS).
+
+To remove these caveats, additionally backport `HAVE_DYNAMIC_FTRACE_WITH_REGS`
+to arm64 4.19 (~200 LOC: `arch/arm64/kernel/entry-ftrace.S` + Kconfig
+`select`). Adapter already reads `regs->regs[0..7]` when regs is present.
+
+### What practical BPF research now works
+
+- ✅ kprobe BPF (always worked, 19+ Android programs running)
+- ✅ tracepoint, raw_tracepoint, perf_event, sched_cls, struct_ops, etc.
+- ✅ uprobe + tracefs (verified live on Qunar `Ena1907_req` with full args)
+- ✅ **BPF fentry programs** — counters, bpf_printk hooks, map updates with constants
+- ✅ **BPF LSM programs** — same caveats; security observability hooks fire
+- ✅ **BPF ext (program extensions)** — replace BPF prog functions
+
+For full-fidelity argument access on kernel function hooks, use uprobe on
+syscalls or kprobe-based tools (frida, stackplz, perf). For hookpoint
+counting / boolean enforcement / event sampling, fentry now works.
 
 dmesg evidence:
 ```
@@ -200,7 +253,12 @@ Survey + strategy: `workspace/kernel/patches/phase2-bpf-backport/00-survey/STRAT
 
 ## Future work (out of scope)
 
+- **Backport `HAVE_DYNAMIC_FTRACE_WITH_REGS`** to 4.19 arm64 (~200 LOC).
+  Removes the args-zero-filled limitation and lets fentry programs
+  read x0..x7 through the ftrace adapter that's already wired up.
 - `BPF_PROG_TYPE_SYSCALL` (5.14+) — source-level backport (~hundreds of lines, verifier changes)
 - `BPF_PROG_TYPE_NETFILTER` (6.x) — source-level backport
 - Bake BTF into `/vendor/firmware/` so it survives factory reset (currently in `/data/local/tmp/`, lost on data wipe)
 - Address remaining file-static struct gaps in BTF (e.g. `bpf_shtab`) by making them externally referenced
+- Real fexit (function exit) hooks via return-trap mechanism — needs the
+  full DIRECT_CALLS path which depends on `WITH_ARGS` (different ABI)

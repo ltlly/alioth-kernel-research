@@ -504,3 +504,178 @@ eBPF program_type ext is available        ← 新解锁
 6. **pahole 会优化掉 file-static struct** —— 这是合理的（DWARF 只看引用），但要做 graceful degradation 处理。
 7. **每个 errout 都要清理资源** —— 我的 vmalloc 缓冲区漏掉了 vfree，每次 parse 失败漏 9.7MB，4 分钟内 OOM 把 bpftool 杀了。
 
+
+---
+
+## Phase 2 Round 2 — fentry attach 真正打通（同日 22:30 - 23:36）
+
+Round 1 让 verifier 接受 tracing/lsm/ext，但 attach 仍然 -ENOTSUPP。这一轮把
+attach 路径接通了。
+
+### 卡点 1：`arch_prepare_bpf_trampoline` 是 `__weak` 默认
+
+CIP-128 backport 了 BPF trampoline 框架（`bpf_trampoline_link_prog`、
+`__bpf_prog_enter/exit` 等），但 `arch/arm64/net/bpf_jit_comp.c` 没带
+arm64 specific 的 trampoline 汇编 emitter。`kernel/bpf/trampoline.c:552`
+仍是 `__weak` stub `return -ENOTSUPP`。
+
+**修复**：从 upstream Linux 6.0 commit `efc9909fdce0` 移植 arm64 trampoline
+emitter，~500 LOC，包含：
+
+1. `arch/arm64/include/asm/insn.h` + `arch/arm64/kernel/insn.c` —
+   新增 `aarch64_insn_gen_load_store_imm()`（4.19 没有 LDR/STR 立即数偏移
+   编码器，trampoline 需要它来访问栈槽）
+2. `arch/arm64/net/bpf_jit.h` — `A64_LS_IMM` macro 族 + `A64_LDR64I`/
+   `A64_STR64I` + `A64_NOP`/`A64_HINT`
+3. `arch/arm64/net/bpf_jit_comp.c` — `arch_prepare_bpf_trampoline()` +
+   `bpf_arch_text_poke()` + helpers (`invoke_bpf_prog`、`prepare_trampoline`、
+   `save_args`、`restore_args`、`emit_call`、`gen_branch_or_nop`、`is_long_jump`)
+
+适配 4.19 vs 6.0 差异：
+- `bpf_tramp_progs` (4.19) vs `bpf_tramp_links` (6.0)
+- `__bpf_prog_enter()` 不带参数 (4.19) vs 带 `(prog, run_ctx)` (6.0)
+- 跳过 BTI 发射、PLT/long-jump 支持（trampoline 在 ±128MB 内）
+
+提交：kernel `9a7c71dabb06`。
+
+### 卡点 2：trampoline emitter 编了但用不到
+
+build + RAM-boot 后跑 `bpftool prog loadall ... autoattach`，仍然 -ENOTSUPP。
+JIT 编出来的 trampoline image 没有被任何代码路径调用。
+
+诊断（pr_info 加在 register_fentry）：
+```
+ksu_bpf: register_fentry ip=... ftrace_managed=1
+ksu_bpf: register_ftrace_direct ret=-524
+```
+
+`register_ftrace_direct` 是 `include/linux/ftrace.h:275` 的 static inline
+stub，gated on `CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS`。Kconfig 依赖链：
+
+```
+DYNAMIC_FTRACE_WITH_DIRECT_CALLS
+  └── HAVE_DYNAMIC_FTRACE_WITH_DIRECT_CALLS
+        └── DYNAMIC_FTRACE_WITH_ARGS && DYNAMIC_FTRACE_WITH_CALL_OPS
+              └── 需要 -fpatchable-function-entry=2 编译指令（不同 ABI！）
+                    └── 4.19 用 -pg mcount 风格，根本不兼容
+```
+
+要按上游路径解锁需重写 4.19 整个 ftrace 子系统。**改用迂回方案**：
+`register_ftrace_function` adapter。
+
+### 解法：用 `register_ftrace_function` 桥接
+
+`kernel/bpf/trampoline.c::register_fentry` 在 `register_ftrace_direct` 返回
+`-ENOTSUPP` 时 fall back 到 `ksu_register_ftrace_adapter()`：
+
+```c
+struct ksu_ftrace_adapter {
+    struct ftrace_ops ops;
+    struct bpf_trampoline *tr;
+};
+
+static notrace void
+ksu_bpf_ftrace_handler(unsigned long ip, unsigned long parent_ip,
+                       struct ftrace_ops *op, struct pt_regs *regs) {
+    struct ksu_ftrace_adapter *ad = container_of(op, ...);
+    /* 遍历 tr->progs_hlist[BPF_TRAMP_FENTRY]，C 里直接调 bpf_func */
+}
+```
+
+`ftrace_set_filter_ip` + `register_ftrace_function` 注册 ops。callback 在
+函数 entry 触发，遍历 prog list 调用每个 BPF 程序。
+
+提交：kernel `8ccba43d1805`，~150 LOC 加到 trampoline.c。
+
+### 卡点 3：`FTRACE_OPS_FL_SAVE_REGS` 返 -EINVAL
+
+第一版用 `FTRACE_OPS_FL_SAVE_REGS`，`register_ftrace_function` 返 -22：
+
+```c
+// kernel/trace/ftrace.c
+#ifndef CONFIG_DYNAMIC_FTRACE_WITH_REGS
+    if (ops->flags & FTRACE_OPS_FL_SAVE_REGS &&
+        !(ops->flags & FTRACE_OPS_FL_SAVE_REGS_IF_SUPPORTED))
+        return -EINVAL;
+#endif
+```
+
+`HAVE_DYNAMIC_FTRACE_WITH_REGS` 在 4.19 arm64 根本没 select，所以 ftrace
+不会保存 pt_regs。改用 `FTRACE_OPS_FL_SAVE_REGS_IF_SUPPORTED` —— 优雅降级，
+注册成功但 callback 拿到 `regs == NULL`。
+
+handler 改成 NULL-check 后用 `args_buf[8] = {0}`：
+
+```c
+if (regs)
+    ctx_args = &regs->regs[0];
+else
+    ctx_args = args_buf;
+p->bpf_func(ctx_args, p->insnsi);
+```
+
+### 卡点 4：`__bpf_prog_enter()` 返 0 → 跳过 bpf_func
+
+第二版编完启动，handler fired 3 次，但 trace_pipe 仍空。
+
+诊断：
+```
+ksu_bpf: __bpf_prog_enter ret=0, calling bpf_func=...
+```
+
+我直接套了 upstream 6.x 的逻辑「if (start) call bpf_func」。但 6.x 的
+`__bpf_prog_enter` 返 0 = recursion detected → 跳过；4.19 的同名函数返 0
+= bpf stats 未启用 → **不跳过**。
+
+修复：4.19 总是 call bpf_func：
+```c
+start = __bpf_prog_enter();
+p->bpf_func(ctx_args, p->insnsi);  /* always call */
+__bpf_prog_exit(p, start);
+```
+
+### 卡点 5：`tracing_on=0` 让 bpf_printk 输出被丢弃
+
+最后一个：handler 跑、bpf_func 跑、但 trace 仍空。原因 `tracing_on` 默认 0
+→ trace ring buffer 不接受写入 → bpf_trace_printk silently dropped。
+
+```bash
+echo 1 > /sys/kernel/tracing/tracing_on
+```
+
+立即看到：
+```
+sh-4443  ... bpf_trace_printk: fentry do_sys_open flags=0
+batterystats-ha-1993 ... fentry do_sys_open flags=0
+... 451 events captured in 1s
+```
+
+### Phase 2 Round 2 时间线
+
+| 时间 | 事件 |
+|---|---|
+| 22:30 | 用户决定继续做 ftrace_direct backport |
+| 22:35 | 调研 upstream 6.0 trampoline 实现 |
+| 22:50 | Step 1: aarch64_insn_gen_load_store_imm + 编译通过 |
+| 23:00 | Step 2-4: 完整 trampoline JIT + bpf_arch_text_poke 编译通过、RAM-boot OK |
+| 23:05 | 测试发现 register_ftrace_direct 仍卡 → commit JIT 部分 |
+| 23:14 | 实现 register_ftrace_function 适配器 |
+| 23:18 | 卡 -EINVAL → 改 SAVE_REGS_IF_SUPPORTED |
+| 23:24 | handler fires 但 bpf_func 不跑 → __bpf_prog_enter 语义差异 |
+| 23:30 | 改 always-call 但 trace 仍空 |
+| 23:34 | 发现 tracing_on=0 → 启用 → **451 events captured!** |
+| 23:36 | flash slot _a 持久化 |
+
+### Round 2 经验教训
+
+1. **多层依赖** —— 一个 -ENOTSUPP 背后可能藏着 3-4 层独立的 backport 缺失。
+   要 trace 完整路径再决定改哪一层。
+2. **stub 的语义可能跨版本变** —— 4.19 的 `__bpf_prog_enter` 返 0 表「无 stats」，
+   6.x 同名函数返 0 表「recursion」。直接复制 6.x 逻辑会错跳过 bpf_func。
+3. **Kconfig 依赖能链锁住整个特性** —— `DIRECT_CALLS` 锁在 `WITH_ARGS` 锁在
+   `-fpatchable-function-entry=2` 编译方式。如果 ABI 锁就基本不可能上游 backport，
+   只能绕道（这次用 ftrace_ops 适配器）。
+4. **diagnostic printk 是必需的** —— ftrace + BPF 路径太多，没有 pr_info 几乎
+   不可能定位问题。
+5. **tracing_on 是个常被忽视的开关** —— 内核里 bpf_printk 输出可能完全正常但
+   被丢弃，因为 trace ring buffer 没启用。

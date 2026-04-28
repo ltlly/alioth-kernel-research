@@ -16,7 +16,8 @@ KernelSU upstream officially [dropped non-GKI support starting v1.0](https://ker
 
 - ✅ **Phase 0** (vanilla kernel rebuild) — DONE
 - ✅ **Phase 1** (BTF + ftrace + KSU manager working) — DONE
-- ✅ **Phase 2** (BPF tracing/lsm/ext via BTF firmware loader) — **DONE** — 29/32 prog types now `available`
+- ✅ **Phase 2 Round 1** (BTF firmware loader → tracing/lsm/ext verifier-level) — DONE
+- ✅ **Phase 2 Round 2** (arm64 trampoline JIT + ftrace_function adapter → fentry actually fires) — DONE — 451 events/sec captured live
 
 ## Quick navigation
 

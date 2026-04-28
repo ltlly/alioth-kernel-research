@@ -15,12 +15,14 @@
 
 ### Runbook
 - [`runbook/2026-04-28-ksu-patches.md`](runbook/2026-04-28-ksu-patches.md) — **每个 KSU 文件改动的详细解释**
-- [`runbook/2026-04-28-btf-firmware-loader.md`](runbook/2026-04-28-btf-firmware-loader.md) — **Phase 2: tracing/lsm/ext 解锁原理 + 50 行 patch 详解**
+- [`runbook/2026-04-28-btf-firmware-loader.md`](runbook/2026-04-28-btf-firmware-loader.md) — **Phase 2 Round 1: tracing/lsm/ext verifier-level 解锁**
+- [`runbook/2026-04-28-arm64-bpf-trampoline.md`](runbook/2026-04-28-arm64-bpf-trampoline.md) — **Phase 2 Round 2: arm64 trampoline JIT + ftrace_function 适配器（fentry 真正 fire）**
 - [`runbook/2026-04-28-recovery-runbook.md`](runbook/2026-04-28-recovery-runbook.md) — **设备砖了怎么救**
 
 ### Phase 2 patch + 工件
 - `workspace/kernel/patches/phase2-bpf-backport/00-survey/STRATEGY.md` — Phase 2 调研结论：CIP 已 backport 五大系列
 - `workspace/kernel/patches/phase2-bpf-backport/00-survey/btf-fw/vmlinux.btf` — 4.19-strict BTF 文件（部署到 `/data/local/tmp/`）
+- `workspace/kernel/patches/phase2-bpf-backport/01-arm64-trampoline/STRATEGY.md` — Round 2 设计 + 4 次踩坑日志 + outcome
 
 ### 项目级状态
 - [`/STATUS.md`](../STATUS.md) — 当前 phase 进度、device 状态、下一步
