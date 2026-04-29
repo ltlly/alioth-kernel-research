@@ -680,44 +680,113 @@ batterystats-ha-1993 ... fentry do_sys_open flags=0
 5. **tracing_on 是个常被忽视的开关** —— 内核里 bpf_printk 输出可能完全正常但
    被丢弃，因为 trace ring buffer 没启用。
 
-## Phase 2 Round 3 — HAVE_DYNAMIC_FTRACE_WITH_REGS (2026-04-29 00:00–00:23)
+## Phase 2 Round 3 (aborted) — mcount-based WITH_REGS (2026-04-29 00:00–00:23)
 
 After Round 2 had fentry attaching and 451 events/sec firing, the
-remaining gap was that the BPF callback always saw `regs == NULL`. So we
-were running BPF programs against a zero-filled args buffer — fine for
-counters and bpf_printk literals, useless for anything that needs to
-read the function's arguments.
+remaining gap was that the BPF callback always saw `regs == NULL` —
+adapter ran on a zero-filled args buffer, useless for anything that
+needs to read the function's arguments.
 
-The fix: backport `HAVE_DYNAMIC_FTRACE_WITH_REGS` to arm64 4.19 in the
-mcount-style. Took three iterations.
+The first attempt was to backport `HAVE_DYNAMIC_FTRACE_WITH_REGS` to
+arm64 4.19 directly on top of the existing mcount path (commit
+`2f9a02d7877f`). Working but fundamentally wrong: the kernel's mcount
+call sequence is `mov x0, x30; bl _mcount`, so by the time
+`ftrace_regs_caller` saves regs, x0 has already been clobbered to
+`parent_pc`. `regs->regs[0]` would therefore always show parent_pc, never
+the function's first argument.
 
-### Round 3 时间表
+When the user saw the implementation they correctly pushed back:
+"我要求和标准的 ebpf 行为完全一致 你做的是将高版本实现移植到低版本 不是自己开发一个似是而非的东西". The Round 3 commit was reverted in
+`47fe2bdbee57` and the work redone properly via Round 4 below.
+
+### Lessons preserved from Round 3
+
+1. **`#ifndef CONFIG_X` blocks vanish when `X=y`.** ftrace.c's
+   IF_SUPPORTED → SAVE_REGS auto-upgrade is gated under
+   `#ifndef CONFIG_DYNAMIC_FTRACE_WITH_REGS` — when the arch enables
+   WITH_REGS, consumers must declare `FL_SAVE_REGS` explicitly. (kprobes
+   already does this.)
+2. **WITH_REGS uses two patch sites, not one.** `ftrace_regs_call` (in
+   `ftrace_regs_caller`) and `ftrace_call` (in `ftrace_caller`) are two
+   distinct NOPs, both need patching by `ftrace_update_ftrace_func`.
+   x86's same-name function patches both; arm64 mainline 5.5 added the
+   pattern via the new `ftrace_common` block that's shared by both
+   trampolines (we adopted this in the Round 4 port).
+3. **mcount ABI guarantees `regs->regs[0] == parent_pc` always.** The
+   compiler-emitted prologue writes `mov x0, x30; bl _mcount`. arg0 may
+   live in a callee-saved register but the choice (x20 / x21 / w19 / ...)
+   varies per function — no generic recovery path. The only true fix is
+   `-fpatchable-function-entry=2` (arm64 5.5+), which Round 4 ports.
+4. **`/sys/kernel/tracing/enabled_functions` is the canonical ftrace
+   diagnostic file.** The `R` flag indicates a record routed through
+   `ftrace_regs_caller`; absence of `R` means the rec is on the regular
+   non-regs caller. The fastest way to check whether ops with
+   `FL_SAVE_REGS` is actually in effect.
+
+## Phase 2 Round 4 — mainline 5.5 + 5.18 BPF trampoline port (2026-04-29 00:30–02:50)
+
+The proper path: stop hacking mcount, port the upstream stack instead.
+Three mainline commits chained together:
+
+| Stage | Mainline | Files | Local commit |
+|---|---|---|---|
+| 1 | Linux 5.5 `fbf6c73c5b26` | `ftrace_init_nop()` weak callback | `ee041ac767d3` |
+| 2 | Linux 5.5 `3b23e4991fb6` | arm64 ftrace with regs (`-fpatchable-function-entry=2`, two-NOP patch site, `ftrace_init_nop` arm64 impl, FTRACE_PLT_IDX/FTRACE_REGS_PLT_IDX module trampolines) | `15491ac9ca5d` |
+| 2 | Linux `e3bf8a67f759` | `aarch64_insn_gen_move_reg()` encoder (used by ftrace_init_nop to patch first NOP into `MOV X9, LR`) | `081b4abff6b2` |
+| 2 | (linker script) | `__patchable_function_entries` section in `MCOUNT_REC()` | `9f78aee2783d` |
+| 3 | Linux 5.18 `f64dd4627ec6` + helper `1904a8144598` | `register_ftrace_direct_multi()` API + `ftrace_add_rec_direct()` factor-out helper | `a89e06fd2f44` |
+
+Plus this branch's specific glue:
+
+| What | Local commit |
+|---|---|
+| arm64 `ftrace_common_return` reads `regs->orig_x0`; if non-zero, set up BPF trampoline ABI (x9=parent_lr, lr=sym+8, x0..x7=args) and `br x10` | `9b69f0d293a4` |
+| BPF JIT: drop the upstream-mirrored `CBZ x20, skip_exec` after `__bpf_prog_enter` (4.19's `__bpf_prog_enter` returns 0 to mean "stats off", not "skip recursion") | `6aa1a1ec0463` |
+| `kernel/bpf/trampoline.c`: switch register/unregister/modify_fentry to direct_multi; remove the dead C-side `ksu_register_ftrace_adapter` adapter | `549c996be470` |
+
+### Round 4 时间表 (key stops)
 
 | 时间 | 事件 |
 |---|---|
-| 00:11 | 初版: Kconfig + asm/ftrace.h ARCH_SUPPORTS_FTRACE_OPS=1 + entry-ftrace.S 加 ftrace_regs_caller + ftrace.c 加 ftrace_modify_call |
-| 00:14 | flash-test 通过 boot smoke。但 BPF prog 看到的 args 还是全 0 |
-| 00:14 | 发现适配器只设 FL_SAVE_REGS_IF_SUPPORTED → IF_SUPPORTED→SAVE_REGS auto-upgrade 在 `#ifndef CONFIG_DYNAMIC_FTRACE_WITH_REGS` 里编译掉了 |
-| 00:17 | 改适配器加 `FL_SAVE_REGS`。重建 + flash |
-| 00:18 | `enabled_functions` 显示 `do_sys_open (1) R` 了 — 但 trace 仍空 |
-| 00:19 | 发现 ftrace_update_ftrace_func 只 patch ftrace_call NOP，不 patch ftrace_regs_call。x86 是 patch 两个 |
-| 00:20 | 改 ftrace.c 同时 patch 两个 NOP。重建 |
-| 00:21 | flash-test: **flags=0x20241, mode=0x1b6 — 真实参数到了!** |
-| 00:22 | flash-commit slot _a |
-| 00:23 | cold reboot 验证: WITH_REGS persistent，`regs->regs[1..7]` 都是真的 |
+| 00:30 | 决定走标准上游路径，撤销 Round 3，开始研究 mainline 补丁 |
+| 00:45 | 第 1 轮：5.5 patchable-fentry 移植，修复 `dup_hash` / 未用变量 / `_mcount` extern guard / `S_FP` asm-offset 缺失 / `aarch64_insn_gen_move_reg` 缺失 — 5 个独立 fix 后 boot 通 |
+| 01:00 | 验证 fentry 工作；发现 BPF 走 register_ftrace_direct 因为 ±128MB 距离失败，触发 `ftrace_kill()` 致命；先保留 ksu_adapter 作为 fallback |
+| 01:25 | 第 2 轮：移植 5.18 register_ftrace_direct_multi。`ftrace_get_addr_new` 短路 FL_DIRECT 仍然走 BPF trampoline 直接 patch — 失败 |
+| 02:00 | 第 3 轮：在 ftrace_get_addr_new 加距离检查，远的 fall-through 到 ops->trampoline = FTRACE_REGS_ADDR；call_direct_funcs 设 regs->orig_x0；arm64 entry-ftrace.S 加 redirect bridge |
+| 02:15 | `enabled_functions` 显示 `R I D` 了 — 但 trace 仍空。`call_direct_funcs` 加 trace_printk 确认 regs->orig_x0 写入成功 |
+| 02:30 | 哨兵测试 (`addr = 0xDEADBEEF000`) 故意 brick — 设备真挂了，watchdog 重启，确认 redirect 路径 fire ✓ |
+| 02:45 | BPF 进入 trampoline 但仍无 bpf_printk 输出 — 翻 JIT，发现 `CBZ x20` 在 `__bpf_prog_enter` 返 0 时 skip_exec，跟 4.19 stats-off 语义冲突 |
+| 02:48 | 删 CBZ 后立即 ENTRY/EXIT 都 fire，`ret=3` 真实文件描述符 ✓ |
+| 02:50 | flash-commit slot _a，cold reboot 验证 standard eBPF |
 
-### Round 3 经验教训
+### Round 4 经验教训
 
-1. **`#ifndef CONFIG_X` 块在 `X=y` 时不存在** —— 看到的 ftrace.c IF_SUPPORTED 自动升级
-   逻辑是给 *无* WITH_REGS arch 准备的兜底；arch 真支持 WITH_REGS 后这条死路。
-   消费者必须明确设 `FL_SAVE_REGS`（参考 kprobes 也是这么做）。
-2. **WITH_REGS 不是单 NOP** —— 一旦走进 ftrace_regs_caller，里面的 `ftrace_regs_call:
-   nop` 和 `ftrace_caller` 里的 `ftrace_call: nop` 是两个 NOP，必须分别 patch。
-   x86 ftrace.c 里 `ftrace_update_ftrace_func` 已经写了这模式，但 arm64 4.19 漏了。
-3. **mcount ABI 决定 `regs->regs[0]` 永远是 parent_pc** —— 因为编译器生成
-   `mov x0, x30; bl _mcount` 把 lr 放进 x0。原始 arg0 spill 到 callee-saved reg，
-   但位置因函数而异（vfs_open: x20，filp_open: x21，ksys_read: w19）—— 没法通用恢复。
-   想拿到 arg0 必须切到 `-fpatchable-function-entry=2` ABI（arm64 5.5+ 路线），
-   要重编整个 kernel 加重写 recordmcount，超出本分支范围。
-4. **enabled_functions 是诊断 ftrace 状态的关键文件** —— 能看 `R` 标志确认 patch site
-   切到 ftrace_regs_caller 了，是确诊 Round-2 vs Round-3 故障的最快路径。
+1. **直接 patch 远端 BPF trampoline 在 KASLR 下永远失败.** alioth Lineage 配置下 BPF JIT 池
+   离 kernel text 5GB+，bl 不可达。`register_ftrace_direct` 单 API 的设计假设 ±128MB
+   reachable —— 这是 mainline 5.18 引入 direct_multi 的核心动机：让 patch site 走
+   `ftrace_regs_caller`，trampoline 通过 register-indirect br 到 BPF（无距离限制）。
+2. **ftrace_kill 是雷区.** ftrace_make_call 返 -EINVAL 触发 ftrace_bug 触发
+   `FTRACE_WARN_ON_ONCE` 触发 `ftrace_kill()` —— ftrace_disabled=1 后所有 ftrace
+   注册返 -ENODEV 直到重启。debug 时一定要先把 fail-fast 路径的 -EINVAL 截掉，
+   否则连续 attempt 全废。
+3. **`__bpf_prog_enter` 跨版本语义不同.** 4.19 返 0 = stats off (默认正常); 6.x 返 0 = skip
+   due to recursion. 上游 6.0 BPF 移植到 4.19 不能照搬上游 JIT 逻辑 —— 这次踩了两遍
+   (Round 2 修过 C 侧 handler，Round 4 又在 JIT 里发现了同样的坑)。
+4. **哨兵 sentinel 是定位 silent-fail 的快速方法.** 当 redirect 链 ABI 复杂、看不到事件时，
+   把目标地址改成 `0xDEADBEEF000` 故意触发 brick：watchdog 重启 ⇒ 路径 fire；
+   设备正常 ⇒ 路径没 fire。一次 flash-test 周期得到二元答案。
+
+## Phase 2 Round 5 — BTF 持久化 + bpf_shtab 收尾 (2026-04-29 09:45–09:55)
+
+最后两个清理项：
+
+1. **`bpf_shtab` BTF gap** (commit `dabee90203b9`): `net/core/sock_map.c` 的 sockhash struct
+   命名为 `bpf_htab` 跟 `kernel/bpf/hashtab.c` 同名 static struct 冲突，pahole 静默丢
+   一个。mainline 已 rename 为 `bpf_shtab`；38 处替换。重新生成 BTF 后 dmesg 警告消失。
+
+2. **BTF 移到 persist 分区** (commit `43c03d52ba05`): 调研发现 `/mnt/vendor/persist`
+   是 Android vAB 设备的「永远不能丢的数据」分区（calibration / MAC / modem cfg），
+   ext4 RW，57MB 容量，工厂重置不擦。把它放到 BTF 搜索路径首位，比修改 EROFS
+   /vendor 分区干净得多。
+
+至此原计划完成度 100% (除明确标记的 non-goals)。

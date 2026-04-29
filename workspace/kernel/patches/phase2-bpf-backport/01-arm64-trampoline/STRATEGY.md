@@ -195,21 +195,26 @@ $ ls / ; cat /sys/kernel/tracing/trace
 4.19-cip kernel. The `tracing` prog type is no longer just "available"
 in the verifier sense — programs really run and produce output.
 
-### Caveats
+### Caveats (historical — Round 2 only)
 
-1. **Args zero-filled**: 4.19 arm64 has no `HAVE_DYNAMIC_FTRACE_WITH_REGS`,
-   so ftrace doesn't pass pt_regs to the callback. Programs that read arg
-   registers get 0. Programs that count, bpf_printk literals, or update
-   maps with constants work.
-2. **fexit acts as fentry**: the adapter triggers only at function entry.
-   The fexit prog gets attached and will run, but at entry, not at return.
-3. **~100 cycle overhead per call** vs ~10 for native DIRECT_CALLS.
+The original Round 2 implementation shipped a C-side adapter
+(`ksu_register_ftrace_adapter`) which had three limitations:
 
-### What's still future work
+1. Args zero-filled (no `HAVE_DYNAMIC_FTRACE_WITH_REGS` on 4.19 arm64).
+2. fexit fired at entry, not at function return.
+3. ~100 cycle overhead vs ~10 for native DIRECT_CALLS.
 
-To get args populated, backport `HAVE_DYNAMIC_FTRACE_WITH_REGS` to 4.19
-arm64 (~200 LOC: `arch/arm64/kernel/entry-ftrace.S` + Kconfig select).
-Then the existing `FTRACE_OPS_FL_SAVE_REGS_IF_SUPPORTED` flag will start
-returning real pt_regs and our adapter will read x0..x7 from there
-(code path already wired up).
+**These limitations no longer apply.** Round 4 (commits `ee041ac767d3` →
+`549c996be470`) ported mainline 5.5 patchable-fentry + 5.18
+register_ftrace_direct_multi proper, and removed the C-side adapter.
+The current path is exactly the upstream one:
+
+  bl ftrace_regs_caller  →  call_direct_funcs  →
+  arch_ftrace_set_direct_caller(regs, addr)  →
+  ftrace_common_return reads regs->orig_x0  →  br to BPF trampoline JIT
+
+`ctx[0..N]` are real function arguments, fexit fires after `ret` with
+the real return value, fmod_ret can modify return values. See
+`docs/runbook/2026-04-29-mainline-direct-multi-port.md` for the full
+end-to-end port.
 

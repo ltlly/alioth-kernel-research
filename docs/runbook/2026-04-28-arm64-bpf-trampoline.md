@@ -1,153 +1,117 @@
-# arm64 BPF Trampoline + ftrace_function Adapter
+# arm64 BPF trampoline JIT — backport of upstream 6.0
 
-**Date:** 2026-04-28
-**Outcome:** BPF `tracing` (fentry/fexit), `lsm`, `ext` programs now actually
-**attach** to kernel functions on alioth 4.19-cip arm64. 451 fentry events
-captured in 1 second of `ls/cat/sh` activity during live verification.
+**Date:** 2026-04-28 (initial JIT) → 2026-04-29 (integrated with mainline 5.18 direct_multi)
+**Outcome:** `arch_prepare_bpf_trampoline()` and `bpf_arch_text_poke()` now have working
+arm64 implementations on alioth 4.19-cip — the JIT layer underneath BPF
+fentry/fexit/fmod_ret. Combined with the 5.5 patchable-fentry port and 5.18
+register_ftrace_direct_multi port, this delivers fully standard upstream
+eBPF behavior on alioth.
 
-## Problem layered (3 layers deep)
+## What this commit provides
 
-| Layer | Blocker | Where |
-|---|---|---|
-| 1 | `arch_prepare_bpf_trampoline()` is `__weak` returning `-ENOTSUPP` | `kernel/bpf/trampoline.c:552` |
-| 2 | `register_ftrace_direct()` is a stub returning `-ENOTSUPP` | `include/linux/ftrace.h:275` (gated on `DYNAMIC_FTRACE_WITH_DIRECT_CALLS` which depends on `-fpatchable-function-entry=2` ABI we don't have on 4.19) |
-| 3 | `register_ftrace_function` with `FTRACE_OPS_FL_SAVE_REGS` returns `-EINVAL` because `HAVE_DYNAMIC_FTRACE_WITH_REGS` not selected on 4.19 arm64 | `kernel/trace/ftrace.c` |
+Backport of upstream Linux 6.0 commit `efc9909fdce0` ("bpf, arm64: Implement
+bpf_arch_text_poke() for arm64") and its companion 6.0 BPF trampoline JIT,
+landed on this branch as commit `9a7c71dabb06`:
 
-CIP-128 backported the BPF trampoline framework but none of the arm64
-specific code beneath it. Each layer has its own backport story.
-
-## The fix — two commits in `android_kernel_xiaomi_sm8250-bpf-research`
-
-### Commit `9a7c71dabb06` — arm64 BPF trampoline JIT (~500 LOC)
-
-Backport of upstream Linux 6.0 `efc9909fdce0`. Implements:
-
-- `arch/arm64/include/asm/insn.h`: enum `AARCH64_INSN_LDST_LOAD/STORE_IMM_OFFSET`,
-  function decl `aarch64_insn_gen_load_store_imm`, plus `__AARCH64_INSN_FUNCS`
-  entries for `ldr_imm` / `str_imm`.
-- `arch/arm64/kernel/insn.c`: implements `aarch64_insn_gen_load_store_imm()`.
-- `arch/arm64/net/bpf_jit.h`: `A64_LS_IMM` macro family + `A64_LDR64I` /
+- `arch/arm64/include/asm/insn.h` — enum
+  `AARCH64_INSN_LDST_LOAD/STORE_IMM_OFFSET`, declaration of
+  `aarch64_insn_gen_load_store_imm()`, plus `__AARCH64_INSN_FUNCS` entries
+  for `ldr_imm` / `str_imm`.
+- `arch/arm64/kernel/insn.c` — `aarch64_insn_gen_load_store_imm()` impl.
+- `arch/arm64/net/bpf_jit.h` — `A64_LS_IMM` macro family + `A64_LDR64I` /
   `A64_STR64I` / `A64_NOP` / `A64_HINT`.
 - `arch/arm64/net/bpf_jit_comp.c`:
   - `emit_call()` helper
-  - `save_args` / `restore_args`
-  - `invoke_bpf_prog()` — emits asm to call one BPF prog
-  - `prepare_trampoline()` — main trampoline body emitter
-  - `arch_prepare_bpf_trampoline()` — public API, two-pass JIT
+  - `save_args()` / `restore_args()`
+  - `invoke_bpf_prog()` — emits asm to call one BPF prog with
+    `__bpf_prog_enter` / `__bpf_prog_exit` wrapping
+  - `prepare_trampoline()` — main trampoline body emitter (handles
+    fentry, optional `bl orig_call`, optional fexit, frame management)
+  - `arch_prepare_bpf_trampoline()` — public API, two-pass JIT (size
+    pass + emit pass)
   - `is_long_jump`, `gen_branch_or_nop`
-  - `bpf_arch_text_poke()` — runtime nop ↔ bl patcher
+  - `bpf_arch_text_poke()` — runtime nop ↔ bl patcher used by the BPF
+    trampoline core (kernel/bpf/trampoline.c) to install/remove the
+    trampoline at a function's patch site.
 
-Adapted from upstream 6.0:
-- 4.19's `bpf_tramp_progs` (with `progs[]` / `nr_progs`) instead of
-  `bpf_tramp_links` (with `links[]` / `nr_links`).
-- 4.19's `__bpf_prog_enter()` is `(void)` returning `u64` (no `run_ctx`).
-- Skip `BPF_TRAMP_F_IP_ARG` / `RET_FENTRY_RET` / fmod_ret in V1.
-- No PLT/long-jump support (trampoline within ±128MB of patch site).
-- No BTI emission (kernel not built with `CONFIG_ARM64_BTI_KERNEL`).
+Adapted from upstream 6.0 with these 4.19-tree differences:
 
-The strong-symbol overrides the upstream `__weak` stub — `nm out/vmlinux`
-confirms our `arch_prepare_bpf_trampoline` is at runtime.
+- Uses 4.19's `bpf_tramp_progs` (with `progs[]` / `nr_progs`) instead of
+  upstream's `bpf_tramp_links` (with `links[]` / `nr_links`).
+- Uses 4.19's `__bpf_prog_enter()` (no args, returns `u64`) instead of
+  upstream's `__bpf_prog_enter(prog, run_ctx)`.
+- Skips `BPF_TRAMP_F_IP_ARG` / `RET_FENTRY_RET` / fmod_ret machinery
+  in V1.
+- No PLT/long-jump support: the JIT'd trampoline must be within ±128MB of
+  every patch site that calls it. With the mainline 5.18
+  `register_ftrace_direct_multi` route added in commit `a89e06fd2f44`,
+  this constraint is no longer binding — the patch site goes to
+  `ftrace_regs_caller` (always reachable) and the regs-caller's epilogue
+  performs an unconstrained `br x10` to reach the trampoline.
+- No BTI emission (alioth kernel is built without `CONFIG_ARM64_BTI_KERNEL`).
 
-### Commit `8ccba43d1805` — `register_ftrace_function` fallback adapter (~150 LOC)
+The strong-symbol implementation overrides the upstream `__weak` stub —
+`nm out/vmlinux` confirms our `arch_prepare_bpf_trampoline` is at runtime.
 
-Even after the JIT is in place, `kernel/bpf/trampoline.c::register_fentry()`
-still goes through `register_ftrace_direct()` (stub) which returns
-`-ENOTSUPP` before our trampoline image is reached.
+## Important: the C-side adapter has been removed
 
-Patch `register_fentry()` to fall back to a custom adapter when DIRECT
-returns `-ENOTSUPP`:
+The original Round 2 work (commit `8ccba43d1805`) shipped with a C
+fallback adapter — `ksu_register_ftrace_adapter` — registering an
+ftrace_ops with `FTRACE_OPS_FL_SAVE_REGS_IF_SUPPORTED` whose `->func`
+invoked the BPF programs from C. That fallback was needed because
+`register_ftrace_direct` returned `-ENOTSUPP` (the 4.19 single-direct
+path lacked arm64 support) and the BPF JIT trampoline path required
+WITH_REGS-like context that 4.19 mcount-based ftrace couldn't deliver.
 
-```c
-if (tr->func.ftrace_managed) {
-    ret = register_ftrace_direct((long)ip, (long)new_addr);
-    if (ret == -ENOTSUPP)
-        ret = ksu_register_ftrace_adapter(tr, ip);
-}
-```
+After Round 4 landed the proper mainline 5.5 + 5.18 backports
+(`-fpatchable-function-entry=2` + `register_ftrace_direct_multi`), the
+adapter is dead code and was deleted in commit `549c996be470`. The
+ftrace_ops dispatch route for fentry/fexit on arm64 4.19 is now exactly
+the upstream one: ftrace patch site → `ftrace_regs_caller` →
+`call_direct_funcs` → `arch_ftrace_set_direct_caller` (writes
+`regs->orig_x0`) → `ftrace_common_return` redirect → BPF trampoline JIT
+(this file).
 
-The adapter is an `ftrace_ops` whose `op->func` is a C handler that
-walks `tr->progs_hlist[BPF_TRAMP_FENTRY]` and calls each prog's
-`bpf_func` directly. Uses `FTRACE_OPS_FL_SAVE_REGS_IF_SUPPORTED` so
-registration succeeds even when ftrace can't deliver pt_regs.
-
-```c
-static notrace void
-ksu_bpf_ftrace_handler(unsigned long ip, unsigned long parent_ip,
-                       struct ftrace_ops *op, struct pt_regs *regs)
-{
-    struct ksu_ftrace_adapter *ad =
-        container_of(op, struct ksu_ftrace_adapter, ops);
-    struct bpf_trampoline *tr = ad->tr;
-    /* When regs is NULL (4.19 arm64 has no WITH_REGS), pass zero-filled
-     * args buffer. BPF prog still runs. */
-    u64 args_buf[8] = { 0 };
-    void *ctx_args = regs ? &regs->regs[0] : args_buf;
-
-    hlist_for_each_entry(aux, &tr->progs_hlist[BPF_TRAMP_FENTRY],
-                         tramp_hlist) {
-        struct bpf_prog *p = aux->prog;
-        u64 start = __bpf_prog_enter();
-        /* 4.19 __bpf_prog_enter returns 0 = stats off (NOT skip prog,
-         * which is upstream 6.x semantics). Always call bpf_func. */
-        p->bpf_func(ctx_args, p->insnsi);
-        __bpf_prog_exit(p, start);
-    }
-}
-```
-
-A per-ip hashtable tracks installed adapters so we can `unregister_fentry`
-them cleanly.
-
-## Caveats (4.19 ABI hard limits)
-
-1. **Args zero-filled** — `regs == NULL` because 4.19 arm64 lacks
-   `HAVE_DYNAMIC_FTRACE_WITH_REGS`. BPF programs that read arg registers
-   (`ctx[0..7]`) get 0. Programs that count, bpf_printk literals, or
-   update maps with constants work fine.
-2. **fexit runs at entry** — adapter is fundamentally a function-entry hook.
-3. **~100 cycles overhead per call** vs ~10 native DIRECT_CALLS.
+The JIT itself is unchanged from the original Round 2 implementation
+except for one bug fix in commit `6aa1a1ec0463`: the upstream-mirrored
+`CBZ x20, skip_exec` after `__bpf_prog_enter` was removed because 4.19's
+`__bpf_prog_enter` returns 0 to mean "stats off" (the normal case), not
+"skip recursion" as it does in upstream 6.x.
 
 ## Live verification
 
 ```
 $ adb root && adb shell setenforce 0
-$ adb push fentry_test.bpf.o /data/local/tmp/
+$ adb push fexit_test.bpf.o /data/local/tmp/
 
 $ adb shell '/system/bin/bpftool prog loadall \
-    /data/local/tmp/fentry_test.bpf.o \
-    /sys/fs/bpf/x autoattach'
-exit: 0
-
+    /data/local/tmp/fexit_test.bpf.o /sys/fs/bpf/y autoattach'
 $ adb shell '/system/bin/bpftool link list'
 1: tracing  prog 77   prog_type tracing  attach_type trace_fentry
 2: tracing  prog 79   prog_type tracing  attach_type trace_fexit
 
-$ adb shell 'echo 1 > /sys/kernel/tracing/tracing_on'   # IMPORTANT
-$ adb shell 'ls / >/dev/null; cat /sys/kernel/tracing/trace | tail'
-sh-4443           [002] d..3    49.347528: bpf_trace_printk: fentry do_sys_open flags=0
-cat-4510          [001] d..3    49.347556: bpf_trace_printk: fentry do_sys_open flags=0
-batterystats-ha-1993 [000] d..3 49.347612: bpf_trace_printk: fentry do_sys_open flags=0
-... 451 events / second ...
+$ adb shell 'echo 1 > /sys/kernel/tracing/tracing_on'
+$ adb shell 'ls / >/dev/null; echo z > /data/local/tmp/test'
+$ adb shell 'cat /sys/kernel/tracing/trace | tail'
+sh ENTRY  dfd=ffffffffffffff9c flags=20241          # AT_FDCWD = -100, real flags
+sh EXIT   dfd=ffffffffffffff9c flags=20241 ret=3    # real return value (fd 3)
+ls ENTRY  dfd=ffffffffffffff9c flags=a8000
+ls EXIT   dfd=ffffffffffffff9c flags=a8000 ret=3
 ```
 
-## Future work to remove the args-zero limitation
+ctx[0] is the real first arg (AT_FDCWD), fexit fires after ret with the
+real return value — fully standard upstream eBPF behavior.
 
-Backport `HAVE_DYNAMIC_FTRACE_WITH_REGS` to arm64 4.19. Estimated
-~200 LOC across:
+## See also
 
-- `arch/arm64/Kconfig`: `select HAVE_DYNAMIC_FTRACE_WITH_REGS`
-- `arch/arm64/kernel/entry-ftrace.S`: in `ftrace_caller`, save full
-  pt_regs to stack instead of the current minimal mcount save set
-- `arch/arm64/kernel/ftrace.c`: handle `FTRACE_OPS_FL_SAVE_REGS` flag
-
-Once that lands, our adapter's `regs->regs[0..7]` codepath becomes live
-without further changes — the BPF programs will start seeing real
-function arguments.
-
-## Reference
-
-- Upstream Linux 6.0 commit `efc9909fdce0`: "bpf, arm64: Implement
-  bpf_arch_text_poke() for arm64" — source for the trampoline JIT.
+- `docs/runbook/2026-04-29-mainline-direct-multi-port.md` — full Round 4
+  port (5.5 patchable-fentry + 5.18 direct_multi + arm64 ABI bridge in
+  `ftrace_common_return`); covers everything end-to-end from why
+  `register_ftrace_direct` was unusable on this branch up to the
+  `regs->orig_x0` redirect mechanism.
+- `docs/runbook/2026-04-28-btf-firmware-loader.md` — BTF firmware loader
+  patch (Round 1) that unlocked the verifier-level acceptance of
+  `tracing` / `lsm` / `ext` prog types.
+- Upstream Linux 6.0 commit `efc9909fdce0` — original source of the JIT.
 - `workspace/kernel/patches/phase2-bpf-backport/01-arm64-trampoline/STRATEGY.md`
-  — full design discussion, dead-end paths investigated, and live
-  outcome timeline.
+  — Round 2 strategy and stop-by-stop debugging history.
